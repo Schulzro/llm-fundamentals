@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Leçon 7 — Décodage : temperature, top-p, top-k et échantillonnage</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <style>
+    .diagram {
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.25rem;
+      margin: 0 0 1.5rem;
+      overflow-x: auto;
+    }
+    .group-label {
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: #fff;
+      background: #1e3a5f;
+      display: inline-block;
+      padding: 0.2rem 0.6rem;
+      border-radius: 4px;
+      margin-bottom: 0.6rem;
+    }
+    .cat { border-left: 4px solid var(--ok); }
+    .cat h3 { margin-top: 0.3rem; }
+    .mono { font-family: var(--mono); font-size: 0.88rem; }
+  </style>
+</head>
+<body>
+<main>
+
+  <div class="lesson-meta">Leçon 07 · Fondamentaux des LLM · Tier 3 — Comment les LLM répondent</div>
+  <h1>Mécanique du décodage : temperature, top-p, top-k et échantillonnage</h1>
+  <p style="color:var(--muted); font-size:0.9rem; margin-bottom:2rem;">~20 min · Objectif entretien : expliquer comment un token est réellement choisi, régler les paramètres de sampling selon la tâche, et repérer les faux leviers (temperature ≠ fiabilité)</p>
+
+  <!-- ── POURQUOI CE SUJET ──────────────────────────────────────────── -->
+  <div class="callout">
+    <p>
+      <strong>Le modèle ne « choisit » pas un token : il produit une distribution de probabilités, et
+      c'est le décodeur qui tranche.</strong> Temperature, top-p et top-k sont les boutons qui gouvernent
+      ce choix — donc le déterminisme, la diversité, la répétition et, en partie, la fiabilité perçue de
+      votre application. C'est la couche où vit le travail quotidien d'un Applied AI Engineer, et une
+      source inépuisable de mauvais réglages.
+    </p>
+  </div>
+
+  <p>
+    Cette leçon couvre la primitive « Decoding &amp; Sampling » de la Carte (S07) : <strong>logits →
+    distribution</strong>, <strong>greedy et beam search</strong>, <strong>temperature</strong>,
+    <strong>top-k et top-p</strong>, <strong>le pipeline complet</strong>, puis <strong>speculative
+    decoding</strong> et l'usage des <em>logprobs</em>. Chaque partie se termine par la formulation
+    prête pour l'entretien et le piège associé.
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 1. DES LOGITS À LA DISTRIBUTION -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>1 · Des logits à la distribution</h2>
+  <span class="group-label">Logits · Softmax · Vocabulaire · Logprobs</span>
+
+  <div class="callout">
+    <p>
+      <strong>À chaque pas, le modèle sort un score (logit) par token du vocabulaire ; un softmax
+      transforme ces scores en une distribution de probabilité sur laquelle on échantillonne.</strong>
+    </p>
+  </div>
+
+  <p>
+    La dernière couche du modèle projette l'état caché vers un vecteur de taille = taille du vocabulaire
+    (50k–200k). Ces valeurs brutes, les <strong>logits</strong>, sont des scores non bornés. Un
+    <strong>softmax</strong> les convertit en probabilités qui somment à 1 :
+  </p>
+  <div class="diagram">
+    <pre><code>p_i = exp(z_i / T) / Σ_j exp(z_j / T)
+
+  z_i  = logit du token i
+  T    = temperature   (T = 1 → softmax standard)</code></pre>
+  </div>
+  <p>
+    Les <strong>logprobs</strong> (logarithmes des probabilités) sont ce que les API exposent : précieux
+    pour la classification, les évaluations, les seuils de confiance et le scoring — et bien plus
+    informatifs qu'un simple token.
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 2. GREEDY ET BEAM SEARCH -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>2 · Greedy et beam search : le décodage déterministe</h2>
+  <span class="group-label">Argmax · k hypothèses · Reproductible</span>
+
+  <div class="callout">
+    <p>
+      <strong>Greedy prend toujours le token le plus probable ; le beam search garde les k meilleures
+      séquences partielles — les deux sont déterministes et sans échantillonnage.</strong>
+    </p>
+  </div>
+  <table>
+    <thead>
+      <tr><th>Méthode</th><th>Principe</th><th>Quand l'utiliser</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Greedy</strong></td>
+        <td>argmax à chaque pas</td>
+        <td>Sortie déterministe : extraction, classification, code de transformation</td>
+      </tr>
+      <tr>
+        <td><strong>Beam search</strong></td>
+        <td>Garde k séquences candidates et maximise la probabilité de la séquence entière</td>
+        <td>Traduction, résumé où une réponse « la plus probable » existe</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="callout warn">
+    <p>
+      <strong>Contre-intuitif mais essentiel :</strong> le beam search ne réduit pas les hallucinations —
+      il peut même en produire davantage. En cherchant la séquence la plus probable, il optimise la
+      <em>vraisemblance</em>, pas la <em>vérité</em>. Pour le dialogue ouvert et la génération créative,
+      il est souvent pire que l'échantillonnage.
+    </p>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 3. TEMPERATURE -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>3 · Temperature : aplatir ou aiguiser la distribution</h2>
+  <span class="group-label">T &lt; 1 · T = 1 · T &gt; 1 · T = 0 ≈ greedy</span>
+
+  <div class="callout">
+    <p>
+      <strong>La temperature divise les logits avant le softmax : au-dessous de 1 elle aiguise (plus
+      déterministe), au-dessus de 1 elle aplatit (plus divers), et à 0 elle se réduit au greedy.</strong>
+    </p>
+  </div>
+
+  <div class="diagram">
+    <pre><code>T → 0⁺   : distribution piquée    → quasi argmax (greedy)
+T = 1    : distribution « naturelle » du modèle
+T → ∞    : distribution plate      → échantillonnage uniforme (bruit)</code></pre>
+  </div>
+  <p>
+    Concrètement, T &lt; 1 rend les tokens déjà probables encore plus probables — utile pour des tâches
+    factuelles ou structurées. T &gt; 1 augmente la diversité — utile pour le brainstorming, les noms,
+    les variantes — mais dégrade la cohérence si poussée trop loin. <strong>T = 0 correspond à
+    greedy</strong> (certaines API traitent exactement 0 comme argmax).
+  </p>
+  <div class="callout warn">
+    <p>
+      <strong>Le faux levier :</strong> « baisse la temperature pour éliminer les hallucinations. » Non.
+      Baisser la temperature rend le modèle plus <em>confiant</em>, pas plus <em>exact</em> : il répétera
+      avec plus d'aplomb une erreur apprise. La fiabilité se traite par la récupération (RAG),
+      l'ancrage dans des sources et les garde-fous — pas par le sampling.
+    </p>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 4. TOP-K ET TOP-P -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>4 · Top-k et top-p : tronquer la queue de distribution</h2>
+  <span class="group-label">Top-k · Nucleus (top-p) · Renormalisation</span>
+
+  <div class="callout">
+    <p>
+      <strong>Top-k garde les k tokens les plus probables ; top-p (nucleus) garde le plus petit
+      ensemble de tokens dont la probabilité cumulée atteint p — puis on renormalise et on échantillonne.</strong>
+    </p>
+  </div>
+
+  <p>
+    Le problème visé : la queue de distribution contient des dizaines de milliers de tokens très peu
+    probables. Si la temperature est élevée, y piocher produit du charabia. Top-k et top-p coupent cette
+    queue <em>avant</em> l'échantillonnage.
+  </p>
+  <table>
+    <thead>
+      <tr><th>Paramètre</th><th>Règle</th><th>Comportement</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Top-k</strong></td>
+        <td>Garder les k tokens de plus haute probabilité</td>
+        <td>Taille <em>fixe</em> ; peu adaptatif</td>
+      </tr>
+      <tr>
+        <td><strong>Top-p</strong> (nucleus)</td>
+        <td>Trier par probabilité décroissante et garder jusqu'à ce que le cumul atteigne p</td>
+        <td>Taille <em>dynamique</em> : petite quand le modèle est sûr, large quand il hésite</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="diagram">
+    <pre><code>Après tri décroissant (p = 0,9) :
+  token A 0,55  cumul 0,55  ✓ gardé
+  token B 0,20  cumul 0,75  ✓ gardé
+  token C 0,12  cumul 0,87  ✓ gardé
+  token D 0,07  cumul 0,94  ✓ gardé   ← atteint 0,9 ici
+  token E 0,03  cumul 0,97  ✗ coupé
+  ... queue coupée ✗
+→ renormaliser {A,B,C,D} puis échantillonner</code></pre>
+  </div>
+  <p>
+    C'est pourquoi <strong>top-p est souvent préféré à top-k</strong> : il s'adapte à la confiance du
+    modèle à chaque pas, là où top-k impose un nombre de candidats identique même quand le modèle est
+    certain. Les valeurs désactivées sont typiquement top_p = 1 ou top_k = 0.
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 5. LE PIPELINE COMPLET -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>5 · Le pipeline de décodage complet</h2>
+  <span class="group-label">Logits → Temperature → Top-k → Top-p → Tirage</span>
+
+  <div class="diagram">
+    <pre><code>logits ──▶ /T (temperature) ──▶ top-k ──▶ top-p ──▶ softmax/renorm ──▶ tirage aléatoire
+   scores      aiguise/aplatit   coupe    coupe       probabilités        token
+                               à k        cumul p     valides</code></pre>
+  </div>
+  <p>
+    L'ordre compte : on applique la temperature <em>puis</em> la troncature (top-k/top-p), <em>puis</em>
+    on renormalise et on tire. Régler les deux seuils et la temperature en même temps rend l'effet
+    difficile à isoler : <strong>la recommandation pratique est de n'ajuster qu'un paramètre à la fois</strong>
+    (souvent top-p seul, ou temperature seule), et de mesurer.
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 6. SPECULATIVE DECODING -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>6 · Speculative decoding : accélérer sans changer la distribution</h2>
+  <span class="group-label">Draft · Vérification · Lossless</span>
+
+  <div class="callout">
+    <p>
+      <strong>Un petit modèle « brouillon » propose plusieurs tokens d'avance, et le grand modèle les
+      vérifie en une seule passe parallèle — acceptés ou corrigés — sans changer la distribution de
+      sortie.</strong>
+    </p>
+  </div>
+  <p>
+    L'astuce exploite l'asymétrie prefill/decode (voir S05) : pendant que le grand modèle, lent et
+    memory-bandwidth-bound, valide un lot de tokens proposés en une passe, le petit modèle, rapide, a
+    déjà proposé la suite. Les tokens acceptés « gratuits » accélèrent le decode typiquement de 2 à 3×.
+  </p>
+  <div class="callout warn">
+    <p>
+      <strong>Le piège classique :</strong> « speculative decoding approxime donc c'est moins précis. »
+      Faux — c'est <strong>lossless</strong> : une règle d'acceptation par rejet garantit que la
+      distribution finale est <em>identique</em> à celle du grand modèle seul. Le seul coût est un
+      surcroît de calcul quand l'acceptation est faible.
+    </p>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 7. RÉGLAGES PRATIQUES -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>7 · Réglages pratiques par tâche</h2>
+  <table>
+    <thead>
+      <tr><th>Tâche</th><th>Réglage typique</th><th>Pourquoi</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Extraction / classification</td>
+        <td>T ≈ 0, greedy, logprobs</td>
+        <td>Déterminisme, réponses stables et reproductibles</td>
+      </tr>
+      <tr>
+        <td>Code / SQL</td>
+        <td>T basse (0–0,3), top-p modéré</td>
+        <td>Une seule syntaxe correcte ; l'aléatoire casse tout</td>
+      </tr>
+      <tr>
+        <td>Q&amp;R factuelle</td>
+        <td>T basse mais non nulle (0,2–0,3)</td>
+        <td>Un peu de robustesse sans divaguer</td>
+      </tr>
+      <tr>
+        <td>Rédaction / résumé</td>
+        <td>T ≈ 0,7, top-p 0,9</td>
+        <td>Diversité contrôlée, style fluide</td>
+      </tr>
+      <tr>
+        <td>Brainstorming / créatif</td>
+        <td>T 0,9–1,2, top-p 0,95</td>
+        <td>Explorer des variantes ; tolérer l'imprévu</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 8. PIÈGES -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>8 · Les pièges d'entretien</h2>
+  <table>
+    <thead>
+      <tr><th>Piège</th><th>La bonne réponse</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>« Temperature plus basse = moins d'hallucinations »</td>
+        <td>Non : plus de confiance, pas plus d'exactitude. La fiabilité vient du RAG et des garde-fous.</td>
+      </tr>
+      <tr>
+        <td>« Temperature = 0 est un vrai réglage »</td>
+        <td>C'est le greedy (argmax) ; il n'y a plus d'échantillonnage du tout.</td>
+      </tr>
+      <tr>
+        <td>« Top-p et top-k font la même chose »</td>
+        <td>Non : top-k est fixe, top-p est dynamique et s'adapte à la confiance.</td>
+      </tr>
+      <tr>
+        <td>« Beam search élimine les hallucinations »</td>
+        <td>Non : il maximise la vraisemblance, ce qui peut amplifier les fausses certitudes.</td>
+      </tr>
+      <tr>
+        <td>« Speculative decoding approxime »</td>
+        <td>Non : c'est lossless, la distribution de sortie est préservée.</td>
+      </tr>
+      <tr>
+        <td>« Je règle T, top-p et top-k ensemble »</td>
+        <td>À éviter : ajuster un paramètre à la fois et mesurer l'effet.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- C.A.T. -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <div class="callout cat">
+    <h3>C.A.T. — « Expliquez temperature, top-p et top-k. »</h3>
+    <p><strong>Classify :</strong> « Ce sont les paramètres d'échantillonnage qui contrôlent comment un token est choisi parmi la distribution de sortie du modèle. »</p>
+    <p><strong>Apply :</strong> « Le modèle produit des logits, le softmax en fait une distribution. La temperature divise les logits : &lt;1 aiguise (plus déterministe), &gt;1 aplatit (plus divers), 0 revient au greedy. Top-k garde les k tokens les plus probables ; top-p garde le plus petit ensemble dont le cumul atteint p, de façon dynamique. On applique temperature puis troncature, on renormalise, et on tire. »</p>
+    <p><strong>Trap :</strong> « Le réglage à éviter est de les bouger tous en même temps — on n'isole plus l'effet. Et attention : baisser la temperature ne rend pas le modèle plus exact, seulement plus confiant. »</p>
+  </div>
+
+  <div class="callout cat">
+    <h3>C.A.T. — « Comment régleriez-vous le sampling pour un système de Q&amp;R factuelle en production ? »</h3>
+    <p><strong>Classify :</strong> « C'est un choix de décodage à équilibrer entre déterminisme, robustesse et diversité perçue. »</p>
+    <p><strong>Apply :</strong> « Temperature basse mais non nulle — autour de 0,2–0,3 — pour éviter la rigidité du greedy sans divaguer, avec un top-p modéré autour de 0,9 pour couper la queue. J'expose les logprobs pour détecter les cas de faible confiance et déclencher une escalade ou un abstention. »</p>
+    <p><strong>Trap :</strong> « Le piège serait de croire que le sampling garantit la fiabilité. Ce n'est pas un levier de vérité : je m'appuie sur la récupération et l'ancrage dans les sources, et j'utilise temperature et seuils surtout pour la stabilité, pas pour corriger les erreurs. »</p>
+  </div>
+
+  <!-- ── QUIZ ───────────────────────────────────────────────────────── -->
+  <div class="quiz">
+    <h2>Contrôle de restitution</h2>
+    <p style="color:var(--muted); font-size:0.9rem; margin-bottom:1rem;">Ne cherchez pas. Répondez de mémoire, à voix haute si possible.</p>
+
+    <div class="quiz-q" id="q1">
+      <p>1. Que produit le modèle avant tout choix de token ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Directement l'identifiant du token le plus probable</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Un vecteur de logits, converti en distribution de probabilité par un softmax</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Un texte déjà décodé que l'on filtre</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q2">
+      <p>2. Que fait une temperature inférieure à 1 ?</p>
+      <button class="quiz-option" onclick="answer(this,'correct')">Elle aiguise la distribution — les tokens probables le deviennent encore plus</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Elle aplatit la distribution pour plus de diversité</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Elle coupe la queue de distribution</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q3">
+      <p>3. Quelle est la différence essentielle entre top-k et top-p ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Top-k s'applique avant le softmax, top-p après</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Top-k garde un nombre fixe de tokens ; top-p garde un ensemble de taille dynamique selon la probabilité cumulée</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Top-p ne fonctionne que pour la classification</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q4">
+      <p>4. Temperature = 0 correspond à…</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…un échantillonnage uniforme</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">…un décodage greedy (argmax)</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…la désactivation du top-p</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q5">
+      <p>5. Baisser la temperature réduit-il les hallucinations ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Oui, c'est le remède principal</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Non — il rend le modèle plus confiant, pas plus exact</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Oui, mais seulement en dessous de 0,5</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q6">
+      <p>6. Le beam search réduit-il les hallucinations ?</p>
+      <button class="quiz-option" onclick="answer(this,'correct')">Non : il maximise la vraisemblance de la séquence, ce qui peut amplifier de fausses certitudes</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Oui, en gardant les meilleures séquences</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Oui, car il est déterministe</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q7">
+      <p>7. Le speculative decoding change-t-il la distribution de sortie ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Oui, c'est une approximation du grand modèle</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Non — il est lossless : la distribution reste identique à celle du grand modèle seul</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Oui, il ne conserve que les tokens acceptés sans correction</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div id="score-banner" class="score-banner"></div>
+  </div>
+
+  <!-- ── SOURCES PRIMAIRES ───────────────────────────────────────────── -->
+  <h2>Sources primaires</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/1904.09751" target="_blank">Holtzman et al. — « The Curious Case of Neural Text Degeneration »</a> (nucleus sampling / top-p)</li>
+    <li><a href="https://arxiv.org/abs/1805.04833" target="_blank">Fan et al. — « Hierarchical Neural Story Generation »</a> (top-k sampling)</li>
+    <li><a href="https://arxiv.org/abs/2211.17192" target="_blank">Leviathan et al. — « Fast Inference from Transformers via Speculative Decoding »</a></li>
+    <li><a href="https://arxiv.org/abs/2302.01318" target="_blank">Chen et al. — « Accelerating Large Language Model Decoding with Speculative Sampling »</a></li>
+    <li><a href="https://platform.openai.com/docs/api-reference" target="_blank">Documentation API (temperature, top_p, logprobs)</a> — sémantique des valeurs par défaut</li>
+  </ul>
+
+  <!-- ── ET ENSUITE ──────────────────────────────────────────────────── -->
+  <h2>Et ensuite</h2>
+  <p style="color:var(--muted); font-size:0.9rem;">
+    Dites « suivant » pour suivre le plan, ou choisissez une session :
+  </p>
+  <ul>
+    <li><strong>S08 — Chain-of-thought et techniques de prompting :</strong> raisonnement pas à pas, few-shot, self-consistency (Tier 3)</li>
+    <li><a href="0005-kv-cache-fr.html">S05 — KV cache en profondeur :</a> prefill vs decode, la base du speculative decoding</li>
+    <li><a href="0006-tokenization-bpe-quirks-fr.html">S06 — Tokenisation :</a> ce sur quoi porte réellement la distribution</li>
+    <li><a href="0003-llm-primitives-map.html">← Retour à la Carte des primitives</a></li>
+    <li><a href="0002-interview-framework.html">← Leçon 2 — Le cadre C.A.T.</a></li>
+  </ul>
+
+  <div class="ask-teacher">
+    <strong>Posez n'importe quelle question à votre professeur.</strong> Vous voulez dérouler le calcul
+    de top-p sur une distribution réelle, choisir un réglage pour une tâche précise, ou répéter une
+    réponse C.A.T. à voix haute et obtenir un retour ? Dites-le simplement.
+  </div>
+
+</main>
+
+<script>
+  let answered = {};
+  const TOTAL = 7;
+  const feedbacks = {
+    correct: "Correct.",
+    wrong: "Pas tout à fait — relisez la section ci-dessus et réessayez."
+  };
+
+  function answer(btn, result) {
+    const qDiv = btn.closest('.quiz-q');
+    const qId = qDiv.id;
+    if (answered[qId]) return;
+    answered[qId] = result;
+
+    qDiv.querySelectorAll('.quiz-option').forEach(b => b.disabled = true);
+    btn.classList.add(result);
+    qDiv.querySelector('.quiz-feedback').textContent = feedbacks[result];
+
+    if (Object.keys(answered).length === TOTAL) {
+      const correct = Object.values(answered).filter(v => v === 'correct').length;
+      const banner = document.getElementById('score-banner');
+      banner.textContent = correct >= 6
+        ? `${correct}/${TOTAL} — solide. Vous maîtrisez le choix de token, du logit au tirage.`
+        : `${correct}/${TOTAL} — revoyez les erreurs, puis expliquez temperature, top-p et top-k à voix haute, et pourquoi ils ne corrigent pas les hallucinations.`;
+      banner.classList.add('show', correct >= 6 ? 'pass' : 'fail');
+    }
+  }
+</script>
+</body>
+</html>

@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 3 — The LLM Primitives Map</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <style>
+    .tier {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 1.5rem;
+      overflow: hidden;
+    }
+    .tier-header {
+      padding: 0.7rem 1rem;
+      font-family: var(--mono);
+      font-size: 0.85rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .tier-header.t1 { background: #1e3a5f; color: #fff; }
+    .tier-header.t2 { background: #1e4d3a; color: #fff; }
+    .tier-header.t3 { background: #4a1e5f; color: #fff; }
+    .tier-header.t4 { background: #5f3a1e; color: #fff; }
+    .tier-body { padding: 1rem 1.2rem; }
+    .primitive-group { margin-bottom: 1rem; }
+    .primitive-group:last-child { margin-bottom: 0; }
+    .primitive-group h4 {
+      font-size: 0.9rem;
+      font-family: var(--mono);
+      color: var(--muted);
+      margin-bottom: 0.3rem;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    .tags { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+    .tag {
+      font-family: var(--mono);
+      font-size: 0.8rem;
+      padding: 0.2rem 0.55rem;
+      border-radius: 4px;
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    .tag.hot {
+      background: #fef3c7;
+      border-color: #d97706;
+      color: #92400e;
+    }
+    .legend {
+      display: flex;
+      gap: 1.2rem;
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-bottom: 1.5rem;
+      align-items: center;
+    }
+    .legend .tag { font-size: 0.75rem; padding: 0.15rem 0.45rem; }
+    .session-table td:first-child { font-family: var(--mono); font-size: 0.85rem; white-space: nowrap; }
+    .session-table td:nth-child(2) { font-size: 0.88rem; }
+    .session-table td:nth-child(3) { font-size: 0.8rem; color: var(--muted); }
+    .done { color: var(--ok); font-weight: 700; }
+    .current { color: var(--accent); font-weight: 700; }
+  </style>
+</head>
+<body>
+<main>
+
+  <div class="lesson-meta">Lesson 03 · LLM Fundamentals · Orientation</div>
+  <h1>The LLM Primitives Map</h1>
+  <p style="color:var(--muted); font-size:0.9rem; margin-bottom:1.5rem;">The complete top-down map of what an Applied AI Engineer interview can test. One session per primitive cluster.</p>
+
+  <div class="legend">
+    <span>Legend:</span>
+    <span class="tag hot">high-freq</span> appears in nearly every interview
+    <span class="tag">standard</span> appears in most interviews
+  </div>
+
+  <!-- ── TIER 1: HOW LLMS THINK ──────────────────────────────────────── -->
+  <div class="tier">
+    <div class="tier-header t1">Tier 1 — How LLMs Think (Model Internals)</div>
+    <div class="tier-body">
+      <p style="font-size:0.88rem; color:var(--muted); margin-bottom:1rem;">The "how does it actually work" questions. Interviewers use these to filter for depth.</p>
+
+      <div class="primitive-group">
+        <h4>Attention & Architecture</h4>
+        <div class="tags">
+          <span class="tag hot">self-attention (Q/K/V)</span>
+          <span class="tag hot">causal / masked attention</span>
+          <span class="tag hot">multi-head attention</span>
+          <span class="tag hot">KV cache</span>
+          <span class="tag">positional encoding (RoPE, ALiBi)</span>
+          <span class="tag">prefill vs. decode phase</span>
+          <span class="tag">encoder-only vs decoder-only</span>
+          <span class="tag">MoE (Mixture of Experts)</span>
+          <span class="tag">Flash Attention</span>
+          <span class="tag">GQA / MQA</span>
+        </div>
+      </div>
+
+      <div class="primitive-group">
+        <h4>Tokenization</h4>
+        <div class="tags">
+          <span class="tag hot">BPE (Byte-Pair Encoding)</span>
+          <span class="tag">token vs. character vs. word</span>
+          <span class="tag">why arithmetic fails at token level</span>
+          <span class="tag">context window = tokens, not chars</span>
+        </div>
+      </div>
+
+      <div class="primitive-group">
+        <h4>Scaling Laws</h4>
+        <div class="tags">
+          <span class="tag hot">Chinchilla scaling</span>
+          <span class="tag">compute-optimal training</span>
+          <span class="tag">emergent abilities</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── TIER 2: HOW LLMS LEARN ──────────────────────────────────────── -->
+  <div class="tier">
+    <div class="tier-header t2">Tier 2 — How LLMs Learn (Training & Alignment)</div>
+    <div class="tier-body">
+      <p style="font-size:0.88rem; color:var(--muted); margin-bottom:1rem;">The "how did it get good at following instructions" questions.</p>
+
+      <div class="primitive-group">
+        <h4>Pre-training</h4>
+        <div class="tags">
+          <span class="tag hot">next-token prediction / cross-entropy loss</span>
+          <span class="tag">data curation at scale</span>
+          <span class="tag">parallelism (data, tensor, pipeline)</span>
+          <span class="tag">mixed-precision (BF16, FP8)</span>
+        </div>
+      </div>
+
+      <div class="primitive-group">
+        <h4>Alignment</h4>
+        <div class="tags">
+          <span class="tag hot">RLHF (reward model, PPO, KL constraint)</span>
+          <span class="tag hot">DPO</span>
+          <span class="tag">SFT / instruction tuning</span>
+          <span class="tag">RLAIF</span>
+          <span class="tag">Constitutional AI</span>
+          <span class="tag">reward hacking / Goodhart's Law</span>
+        </div>
+      </div>
+
+      <div class="primitive-group">
+        <h4>Fine-tuning & PEFT</h4>
+        <div class="tags">
+          <span class="tag hot">LoRA (rank, alpha, target modules)</span>
+          <span class="tag hot">QLoRA</span>
+          <span class="tag">prefix tuning / prompt tuning</span>
+          <span class="tag">catastrophic forgetting</span>
+          <span class="tag">RAG vs. fine-tuning decision</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── TIER 3: HOW LLMS RESPOND ────────────────────────────────────── -->
+  <div class="tier">
+    <div class="tier-header t3">Tier 3 — How LLMs Respond (Inference & Prompting)</div>
+    <div class="tier-body">
+      <p style="font-size:0.88rem; color:var(--muted); margin-bottom:1rem;">The day-to-day engineering layer — what most Applied AI roles live in.</p>
+
+      <div class="primitive-group">
+        <h4>Decoding & Sampling</h4>
+        <div class="tags">
+          <span class="tag hot">temperature</span>
+          <span class="tag hot">top-p (nucleus sampling)</span>
+          <span class="tag">top-k</span>
+          <span class="tag">greedy / beam search</span>
+          <span class="tag">speculative decoding</span>
+          <span class="tag">logprobs</span>
+        </div>
+      </div>
+
+      <div class="primitive-group">
+        <h4>Prompting Techniques</h4>
+        <div class="tags">
+          <span class="tag hot">chain-of-thought (CoT)</span>
+          <span class="tag hot">few-shot prompting</span>
+          <span class="tag">zero-shot</span>
+          <span class="tag">self-consistency / majority vote</span>
+          <span class="tag">ReAct (Reason + Act)</span>
+          <span class="tag">structured output (JSON schema)</span>
+          <span class="tag">"lost in the middle"</span>
+        </div>
+      </div>
+
+      <div class="primitive-group">
+        <h4>Context Engineering</h4>
+        <div class="tags">
+          <span class="tag hot">prompt caching ← you are here</span>
+          <span class="tag hot">context window management</span>
+          <span class="tag">context compaction / summarization</span>
+          <span class="tag">semantic caching</span>
+          <span class="tag">conversation history strategies</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── TIER 4: HOW LLMS SHIP ───────────────────────────────────────── -->
+  <div class="tier">
+    <div class="tier-header t4">Tier 4 — How LLMs Ship (Systems & Production)</div>
+    <div class="tier-body">
+      <p style="font-size:0.88rem; color:var(--muted); margin-bottom:1rem;">The "have you actually deployed this" questions. Separates engineers from practitioners.</p>
+
+      <div class="primitive-group">
+        <h4>RAG</h4>
+        <div class="tags">
+          <span class="tag hot">RAG pipeline (ingest → chunk → embed → retrieve → generate)</span>
+          <span class="tag hot">dense vs. sparse retrieval (DPR vs. BM25)</span>
+          <span class="tag hot">chunking strategies</span>
+          <span class="tag hot">re-ranking (cross-encoder)</span>
+          <span class="tag">HNSW / vector index types</span>
+          <span class="tag">hybrid retrieval + RRF</span>
+          <span class="tag">RAG triad (relevance, faithfulness, answer)</span>
+          <span class="tag">agentic RAG</span>
+        </div>
+      </div>
+
+      <div class="primitive-group">
+        <h4>Agents & Tool Use</h4>
+        <div class="tags">
+          <span class="tag hot">function calling / tool use</span>
+          <span class="tag hot">ReAct loop</span>
+          <span class="tag hot">MCP (Model Context Protocol)</span>
+          <span class="tag">multi-agent orchestration</span>
+          <span class="tag">agent memory (short vs. long term)</span>
+          <span class="tag">compounding error in long tasks</span>
+          <span class="tag">human-in-the-loop triggers</span>
+        </div>
+      </div>
+
+      <div class="primitive-group">
+        <h4>Serving & Cost</h4>
+        <div class="tags">
+          <span class="tag hot">TTFT vs. inter-token latency</span>
+          <span class="tag hot">continuous batching</span>
+          <span class="tag">PagedAttention / vLLM</span>
+          <span class="tag">speculative decoding</span>
+          <span class="tag">quantization (INT8, INT4, GPTQ, AWQ)</span>
+          <span class="tag">model routing / tiered selection</span>
+          <span class="tag">streaming for perceived latency</span>
+          <span class="tag">input vs. output token cost asymmetry</span>
+        </div>
+      </div>
+
+      <div class="primitive-group">
+        <h4>Evaluation</h4>
+        <div class="tags">
+          <span class="tag hot">LLM-as-judge</span>
+          <span class="tag hot">Ragas (RAG-specific metrics)</span>
+          <span class="tag">pass@k</span>
+          <span class="tag">judge failure modes (position bias, verbosity bias)</span>
+          <span class="tag">eval-driven development</span>
+          <span class="tag">benchmark contamination</span>
+          <span class="tag">A/B testing for LLM features</span>
+        </div>
+      </div>
+
+      <div class="primitive-group">
+        <h4>Safety & Security</h4>
+        <div class="tags">
+          <span class="tag hot">hallucination causes and mitigation</span>
+          <span class="tag hot">prompt injection</span>
+          <span class="tag">jailbreaking</span>
+          <span class="tag">guardrails (input + output filtering)</span>
+          <span class="tag">OWASP LLM Top 10</span>
+          <span class="tag">red-teaming</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── SESSION PLAN ────────────────────────────────────────────────── -->
+  <h2>Session plan</h2>
+  <p style="color:var(--muted); font-size:0.88rem; margin-bottom:1rem;">
+    One session per primitive cluster. Each session = one tight lesson + retrieval quiz + C.A.T. answer template.
+    High-freq items get their own session; lower-freq items are grouped.
+  </p>
+
+  <table class="session-table">
+    <thead>
+      <tr><th>#</th><th>Session</th><th>Tier</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="done">S01</td><td class="done">Prompt caching — the core invariant ✓</td><td>T3</td></tr>
+      <tr><td class="done">S02</td><td class="done">Interview framework (C.A.T.) ✓</td><td>—</td></tr>
+      <tr><td class="done">S03</td><td class="done">This map ✓</td><td>—</td></tr>
+      <tr><td class="current">S04</td><td class="current"><a href="0004-tier1-how-llms-think.html">Tier 1 overview — attention, KV cache, tokenization, scaling ← you are here</a></td><td>T1</td></tr>
+      <tr><td class="done">S05</td><td class="done"><a href="0005-kv-cache-fr.html">KV cache — structure, memory, PagedAttention ✓</a></td><td>T1</td></tr>
+      <tr><td class="done">S06</td><td class="done"><a href="0006-tokenization-bpe-quirks-fr.html">Tokenization — BPE, quirks, interview gotchas ✓</a></td><td>T1</td></tr>
+      <tr><td class="done">S07</td><td class="done"><a href="0007-decoding-sampling-fr.html">Temperature, top-p, top-k — decoding mechanics ✓</a></td><td>T3</td></tr>
+      <tr><td class="done">S08</td><td class="done"><a href="0008-cot-prompting-fr.html">Chain-of-thought + prompting techniques ✓</a></td><td>T3</td></tr>
+      <tr><td class="done">S09</td><td class="done"><a href="0009-rlhf-fr.html">RLHF — reward model, PPO, KL constraint ✓</a></td><td>T2</td></tr>
+      <tr><td>S10</td><td>DPO — how it replaces PPO and why</td><td>T2</td></tr>
+      <tr><td>S11</td><td>LoRA / QLoRA — fine-tuning without full compute</td><td>T2</td></tr>
+      <tr><td>S12</td><td>RAG — end-to-end pipeline, chunking, retrieval</td><td>T4</td></tr>
+      <tr><td>S13</td><td>Dense vs. sparse retrieval + re-ranking</td><td>T4</td></tr>
+      <tr><td>S14</td><td>Agents — ReAct, tool use, MCP, multi-agent</td><td>T4</td></tr>
+      <tr><td>S15</td><td>Serving — TTFT, continuous batching, quantization</td><td>T4</td></tr>
+      <tr><td>S16</td><td>Evaluation — LLM-as-judge, Ragas, eval design</td><td>T4</td></tr>
+      <tr><td>S17</td><td>Hallucination + safety — causes, mitigations, prompt injection</td><td>T4</td></tr>
+      <tr><td>S18</td><td>Scaling laws — Chinchilla, emergent abilities</td><td>T1</td></tr>
+      <tr><td>S19</td><td>System design — full interview walkthrough (RAG chatbot)</td><td>T4</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout" style="margin-top:1.5rem;">
+    <p>
+      <strong>The tiers tell you the interview stakes.</strong>
+      Tier 1 filters for depth. Tier 3 is daily Applied AI work. Tier 4 is what gets you hired.
+      Most 60-minute interviews sample one question from each tier — nail the mechanism, apply it to their scenario, name the trap.
+    </p>
+  </div>
+
+  <!-- ── WHAT'S NEXT ─────────────────────────────────────────────────── -->
+  <h2>What's next</h2>
+  <ul>
+    <li>Tell your teacher which session to run next, or say "next" and we follow the plan.</li>
+    <li><a href="0001-prompt-caching-the-core-invariant.html">← Lesson 1 — Prompt Caching</a></li>
+    <li><a href="0002-interview-framework.html">← Lesson 2 — C.A.T. Framework</a></li>
+  </ul>
+
+  <div class="ask-teacher">
+    <strong>Ask your teacher anything.</strong> Want to skip ahead, reorder the plan, or add a topic?
+    Just say so — this map is yours to navigate.
+  </div>
+
+</main>
+</body>
+</html>

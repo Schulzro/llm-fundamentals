@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Leçon 6 — Tokenisation : BPE, bizarreries et pièges d'entretien</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <style>
+    .diagram {
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.25rem;
+      margin: 0 0 1.5rem;
+      overflow-x: auto;
+    }
+    .group-label {
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: #fff;
+      background: #1e3a5f;
+      display: inline-block;
+      padding: 0.2rem 0.6rem;
+      border-radius: 4px;
+      margin-bottom: 0.6rem;
+    }
+    .cat { border-left: 4px solid var(--ok); }
+    .cat h3 { margin-top: 0.3rem; }
+    .mono { font-family: var(--mono); font-size: 0.88rem; }
+  </style>
+</head>
+<body>
+<main>
+
+  <div class="lesson-meta">Leçon 06 · Fondamentaux des LLM · Tier 1 — Internes du modèle</div>
+  <h1>La tokenisation en profondeur : BPE, bizarreries et pièges d'entretien</h1>
+  <p style="color:var(--muted); font-size:0.9rem; margin-bottom:2rem;">~22 min · Objectif entretien : dérouler le BPE pas à pas, expliquer pourquoi l'arithmétique et le comptage de lettres échouent, et relier la tokenisation au coût et à la fenêtre de contexte</p>
+
+  <!-- ── POURQUOI CE SUJET ──────────────────────────────────────────── -->
+  <div class="callout">
+    <p>
+      <strong>La tokenisation est la frontière entre le texte et le modèle.</strong> C'est le seul
+      endroit du pipeline où ce que <em>vous</em> écrivez devient ce que la machine <em>voit</em>.
+      Toutes les questions qui semblent « bizarres » sur les LLM — elles ne comptent pas les lettres,
+      elles ratent l'arithmétique, le même texte coûte plus cher dans telle langue — remontent à ce
+      découpage. En entretien, la tokenisation est le test de profondeur par excellence : on peut
+      bluffer « les LLM utilisent des tokens », mais on ne peut pas dérouler le BPE à froid si on ne
+      l'a pas compris.
+    </p>
+  </div>
+
+  <p>
+    Cette leçon couvre la primitive de la Carte (S06) en quatre temps : <strong>le mécanisme du BPE</strong>,
+    <strong>token ≠ caractère ≠ mot</strong>, <strong>pourquoi l'arithmétique et le comptage échouent</strong>,
+    et <strong>l'impact sur le coût et la fenêtre de contexte</strong>. Chaque partie se termine par la
+    formulation prête pour l'entretien et le piège qui distingue celui qui a lu de celui qui a compris.
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 1. LE MÉCANISME -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>1 · Le mécanisme en une phrase</h2>
+  <span class="group-label">BPE · Sous-mots · Vocabulaire</span>
+
+  <div class="callout">
+    <p>
+      <strong>La tokenisation découpe le texte en unités de sous-mots que le modèle voit réellement ;
+      le Byte-Pair Encoding (BPE) construit ce vocabulaire en fusionnant répétitivement la paire de
+      symboles adjacents la plus fréquente.</strong>
+    </p>
+  </div>
+
+  <h3>Le modèle ne lit ni des caractères ni des mots</h3>
+  <p>
+    Un LLM ne reçoit jamais de texte. Il reçoit une suite d'<strong>identifiants entiers</strong>, chacun
+    pointant vers une entrée d'un <strong>vocabulaire fixe</strong> (typiquement 32k à 200k entrées).
+    La tokenisation est la fonction qui transforme une chaîne en cette suite d'entiers — et
+    inversement. Entre les deux, le modèle ne « voit » que le token.
+  </p>
+
+  <h3>L'algorithme du BPE, étape par étape</h3>
+  <p>
+    Le BPE a été inventé en 1994 comme schéma de compression, puis réutilisé en 2015 pour la traduction
+    neuronale. La version utilisée par les LLM :
+  </p>
+  <ol>
+    <li><strong>Initialiser</strong> le vocabulaire avec les unités de base — les caractères, ou plus souvent les 256 <em>octets</em>.</li>
+    <li><strong>Compter</strong> les paires de symboles adjacents sur tout le corpus d'entraînement, pondérées par la fréquence des mots.</li>
+    <li><strong>Fusionner</strong> la paire la plus fréquente en un nouveau symbole unique ; l'ajouter au vocabulaire.</li>
+    <li><strong>Répéter</strong> les étapes 2–3 jusqu'à atteindre la taille de vocabulaire visée.</li>
+  </ol>
+  <p>
+    Pour encoder un nouveau texte, on applique les fusions apprises <em>dans l'ordre</em> où elles ont
+    été créées. C'est un schéma de compression glouton : les séquences les plus courantes finissent par
+    tenir dans un unique token, et les chaînes rares retombent progressivement jusqu'aux octets.
+  </p>
+
+  <h3>Un exemple jouet, pas à pas</h3>
+  <p>
+    Corpus d'entraînement : <span class="mono">« aaab » ×5</span> et <span class="mono">« aaac » ×3</span>.
+    Le tokenizer démarre avec les symboles de base <span class="mono">{a, b, c}</span>.
+  </p>
+  <table>
+    <thead>
+      <tr><th>Étape</th><th>Paires comptées (fréquence)</th><th>Fusion</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td>(a,a)=16 &nbsp;·&nbsp; (a,b)=5 &nbsp;·&nbsp; (a,c)=3</td>
+        <td><span class="mono">a + a → aa</span></td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td>(aa,a)=8 &nbsp;·&nbsp; (a,b)=5 &nbsp;·&nbsp; (a,c)=3</td>
+        <td><span class="mono">aa + a → aaa</span></td>
+      </tr>
+      <tr>
+        <td>3</td>
+        <td>(aaa,b)=5 &nbsp;·&nbsp; (aaa,c)=3</td>
+        <td><span class="mono">aaa + b → aaab</span></td>
+      </tr>
+      <tr>
+        <td>4</td>
+        <td>(aaa,c)=3</td>
+        <td><span class="mono">aaa + c → aaac</span></td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="diagram">
+    <pre><code>AVANT :  a a a b        a a a c
+APRÈS :  aaab           aaac      ← 4 fusions plus tard, 2 tokens au lieu de 8
+
+Vocabulaire appris : {a, b, c, aa, aaa, aaab, aaac, ...}
+Le BPE a « découvert » que « aaa » va ensemble, puis a distingué b / c à la fin.</code></pre>
+  </div>
+
+  <h3>Sur du vrai texte</h3>
+  <p>
+    Sur un corpus réel, les mêmes fusions produisent un vocabulaire plein de morceaux récurrents. Un mot
+    très courant devient un token unique (« the »), un mot rare se découpe selon ses morphèmes connus
+    (« tokenization » → « token » + « ization »), et une chaîne jamais vue finit par tomber sur des
+    octets individuels.
+  </p>
+
+  <h3>Byte-level BPE : partir des octets, pas des caractères</h3>
+  <p>
+    Le GPT-2 (et la plupart des LLM modernes) utilise du <strong>byte-level BPE</strong> : les unités de
+    base sont les <strong>256 octets</strong>, pas les caractères Unicode. Deux conséquences majeures :
+  </p>
+  <ul>
+    <li><strong>Aucun token hors-vocabulaire (OOV).</strong> Tout texte — emoji, script rare, séquence binaire — est représentable avec les 256 octets. C'est ce qui a éliminé la plaie historique du « &lt;UNK&gt; ».</li>
+    <li><strong>L'espace initial fait partie du token.</strong> En byte-level BPE, <span class="mono">"token"</span> et <span class="mono">" token"</span> (avec l'espace) sont des tokens <em>différents</em>. C'est un détail qui surprend, et une source classique de confusion quand on compte des tokens à la main.</li>
+  </ul>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 2. TOKEN ≠ CARACTÈRE ≠ MOT -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>2 · Token ≠ caractère ≠ mot</h2>
+  <span class="group-label">Ratios · Langues · Formats · Vocabulaires</span>
+
+  <div class="callout">
+    <p>
+      <strong>Un token représente en moyenne environ 4 caractères ou ¾ d'un mot en anglais — mais ce
+      ratio varie fortement selon la langue, le script et le format.</strong> Ne jamais assimiler
+      « token » à « mot » ou « caractère » en entretien.
+    </p>
+  </div>
+
+  <h3>Les tailles de vocabulaire en pratique</h3>
+  <table>
+    <thead>
+      <tr><th>Tokenizer</th><th>Modèles (exemples)</th><th>Taille de vocab.</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><span class="mono">r50k_base</span></td><td>GPT-2, GPT-3</td><td>~50 000</td></tr>
+      <tr><td><span class="mono">cl100k_base</span></td><td>GPT-4, GPT-3.5-turbo</td><td>~100 000</td></tr>
+      <tr><td><span class="mono">o200k_base</span></td><td>GPT-4o, séries o</td><td>~200 000</td></tr>
+      <tr><td>SentencePiece (BPE / unigram)</td><td>LLaMA 1–3, T5</td><td>32k → 128k</td></tr>
+    </tbody>
+  </table>
+  <p>
+    Un vocabulaire plus grand fait tenir plus de séquences dans un seul token — donc moins de tokens
+    pour le même texte — mais alourdit la couche d'embedding et le softmax de sortie. C'est un
+    compromis, pas une victoire gratuite.
+  </p>
+
+  <h3>Le même sens, un coût en tokens différent</h3>
+  <p>
+    Le BPE apprend sur un corpus majoritairement anglais, donc il compresse bien l'anglais. Pour tout le
+    reste, il découpe plus finement :
+  </p>
+  <table>
+    <thead>
+      <tr><th>Contenu</th><th>Tokenisation</th><th>Conséquence</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Anglais courant</td>
+        <td>~4 caractères / token, ~¾ mot / token</td>
+        <td>La référence.</td>
+      </tr>
+      <tr>
+        <td>Scripts non latins (chinois, arabe, hindi)</td>
+        <td>Souvent 1 à 3 tokens par « mot »</td>
+        <td>2 à 3× plus de tokens pour le même sens → plus cher, fenêtre utile plus courte.</td>
+      </tr>
+      <tr>
+        <td>Code</td>
+        <td>Variable : les identifiants rares se fragmentent</td>
+        <td>L'indentation et les symboles consomment des tokens.</td>
+      </tr>
+      <tr>
+        <td>JSON formaté vs. minifié</td>
+        <td>Espaces, sauts de ligne, guillemets répétés</td>
+        <td>Le formatage verbeux coûte des tokens sans porter d'information utile.</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="callout warn">
+    <p>
+      <strong>Le piège :</strong> « tokens » n'est pas une unité universelle. Le même paragraphe peut
+      représenter 2 à 3× plus de tokens selon la langue ou le format. En entretien, ne dites jamais
+      « environ un token par mot » — dites « environ ¾ d'un mot pour l'anglais, et ça varie beaucoup ».
+      C'est aussi un <em>levier de coût réel</em> : minifier un JSON ou reformuler un prompt peut réduire
+      la facture sans rien changer au sens.
+    </p>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 3. POURQUOI L'ARITHMÉTIQUE ÉCHOUE -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>3 · Pourquoi l'arithmétique et le comptage échouent</h2>
+  <span class="group-label">Chiffres · « strawberry » · Alignement</span>
+
+  <div class="callout">
+    <p>
+      <strong>Le modèle opère sur des tokens de sous-mots, pas sur des chiffres ni des lettres
+      individuels, et cette découpe n'a aucune structure stable au niveau du chiffre ou de la lettre.</strong>
+    </p>
+  </div>
+
+  <h3>Les nombres n'ont pas de découpage cohérent</h3>
+  <p>
+    Un nombre comme <span class="mono">12345</span> peut être un seul token, ou découpé en
+    <span class="mono">12</span> + <span class="mono">345</span>, ou autrement — selon ce qui était
+    fréquent dans le corpus. <span class="mono">100</span> est souvent un token unique alors que
+    <span class="mono">101</span> ne l'est pas. Il n'y a donc <strong>pas de grille de chiffres
+    alignée</strong> : pour additionner deux nombres, il faut aligner les unités, les dizaines, les
+    centaines — mais le modèle ne voit jamais cette grille. Chaque chiffre « flotte » à l'intérieur d'un
+    token arbitraire.
+  </p>
+  <div class="diagram">
+    <pre><code>Ce que vous tapez :          1 2 3 4 5
+Ce que le modèle reçoit :   [ "123" ] [ "45" ]      ← deux tokens, frontière arbitraire
+
+Une addition exige :            1 2 3
+                             +    4 5
+                               -------
+                                1 6 8
+                             l'alignement des colonnes n'existe pas côté tokens</code></pre>
+  </div>
+
+  <h3>« Combien de r dans strawberry ? »</h3>
+  <p>
+    Le modèle ne voit pas les lettres <span class="mono">s-t-r-a-w-b-e-r-r-y</span>. Il voit une poignée
+    de tokens de sous-mots ; les caractères à l'intérieur d'un token ne lui sont jamais exposés
+    individuellement. Compter des lettres est donc une opération qu'il doit <em>simuler</em>, pas lire.
+    Ce n'est pas un échec de « raisonnement » à proprement parler — c'est un artefact de représentation.
+  </p>
+
+  <div class="callout warn">
+    <p>
+      <strong>La bonne nuance (celle qui marque des points) :</strong> ces limites se corrigent.
+      Faire écrire les étapes au modèle (chain-of-thought), espacer les chiffres, ou — mieux — déléguer
+      le calcul à un <em>outil</em> (interpréteur de code, calculatrice) rétablit la fiabilité. Ne dites
+      pas « les LLM ne savent pas calculer » ; dites « l'arithmétique de tête est peu fiable à cause de
+      la tokenisation, et se règle avec CoT ou un outil externe ».
+    </p>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 4. COÛT ET FENÊTRE DE CONTEXTE -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>4 · Coût et fenêtre de contexte : tout est en tokens</h2>
+  <span class="group-label">Fenêtre · Tarification · Comptage</span>
+
+  <div class="callout">
+    <p>
+      <strong>La fenêtre de contexte, la tarification et les limites de débit sont tous mesurés en
+      tokens — jamais en caractères ni en mots.</strong>
+    </p>
+  </div>
+
+  <p>
+    Un « contexte de 200K » vaut 200K tokens, soit à peu près 150K mots en anglais — mais nettement
+    moins en code, en scripts non latins ou en longs nombres, qui se tokenisent moins efficacement. De
+    même, on paie par token : <strong>l'entrée et la sortie n'ont pas le même prix</strong> (la sortie
+    est généralement plus chère), et le nombre de tokens est le multiplicateur direct de la facture.
+  </p>
+
+  <div class="callout warn">
+    <p>
+      <strong>Le réflexe professionnel :</strong> on n'estime jamais un coût « au mot ». On compte avec
+      le <em>tokenizer exact du modèle</em> utilisé (tiktoken, <span class="mono">transformers</span>,
+      SentencePiece). C'est un réflexe de Tier 4 qui impressionne : « j'ai mesuré avec le tokenizer du
+      modèle, pas avec <span class="mono">len(texte) / 4</span> ».
+    </p>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 5. LES PIÈGES D'ENTRETIEN -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>5 · Les pièges d'entretien</h2>
+  <span class="group-label">Tokens glitch · Espace · Spéciaux</span>
+
+  <h3>Deux bizarreries qui font mouche</h3>
+  <p>
+    <strong>Les tokens « glitch » / sous-entraînés.</strong> Un vocabulaire peut contenir des tokens
+    présents dans le corpus de tokenisation mais quasi jamais vus à l'entraînement du modèle
+    (l'exemple célèbre : <span class="mono">" SolidGoldMagikarp"</span>, issu d'un pseudo Reddit présent
+    dans les données de tokenisation mais pas d'entraînement). Le modèle a alors un embedding presque non
+    entraîné pour ce token, et ses réponses peuvent devenir incohérentes. C'est la preuve qu'un tokenizer
+    est un objet <em>séparé</em> du modèle, entraîné sur un corpus qui peut différer.
+  </p>
+  <p>
+    <strong>Les tokens spéciaux.</strong> Les tokenizers réservent des tokens de contrôle hors texte
+    réel (début/fin de séquence, remplissage, rôles de chat comme <span class="mono">&lt;|im_start|&gt;</span>
+    ou <span class="mono">[INST]</span>). Ils ne doivent jamais être produits par l'utilisateur ;
+    les injecter via l'entrée est une classe connue de faille (prompt injection au niveau des tokens).
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Piège</th><th>Pourquoi cela se produit</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Compter les lettres (« strawberry »)</td>
+        <td>Le modèle voit des tokens de sous-mots, pas des caractères individuels.</td>
+      </tr>
+      <tr>
+        <td>Arithmétique peu fiable</td>
+        <td>Les nombres sont découpés en tokens arbitraires ; pas d'alignement par chiffre.</td>
+      </tr>
+      <tr>
+        <td>« tokens ≈ mots »</td>
+        <td>Faux : ~¾ de mot en anglais seulement, et cela varie selon le contenu.</td>
+      </tr>
+      <tr>
+        <td>La fenêtre = des caractères</td>
+        <td>Non : elle se compte en tokens, donc varie avec la langue et le format.</td>
+      </tr>
+      <tr>
+        <td>Même texte = même coût</td>
+        <td>Non : langue et format font varier le nombre de tokens de 2 à 3×.</td>
+      </tr>
+      <tr>
+        <td><span class="mono">"token"</span> vs <span class="mono">" token"</span></td>
+        <td>En byte-level BPE, l'espace initial fait partie du token — deux tokens distincts.</td>
+      </tr>
+      <tr>
+        <td>Tokens glitch / spéciaux</td>
+        <td>Vocabulaire partiellement entraîné, et tokens de contrôle injectables.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- C.A.T. -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <div class="callout cat">
+    <h3>C.A.T. — « Pourquoi les LLM échouent-ils sur l'arithmétique ou le comptage de lettres ? »</h3>
+    <p><strong>Classify :</strong> « C'est un artefact de tokenisation, pas un échec de raisonnement. »</p>
+    <p><strong>Apply :</strong> « Le modèle opère sur des tokens de sous-mots issus d'un vocabulaire BPE, pas sur des caractères ni des chiffres. Un nombre comme 12345 peut être un seul token ou découpé arbitrairement, et les lettres à l'intérieur d'un token ne sont pas exposées individuellement — donc ni le calcul par chiffre ni le comptage par lettre n'ont de représentation stable à apprendre. »</p>
+    <p><strong>Trap :</strong> « Ce sont des limites de représentation, pas d'intelligence : elles se corrigent avec du chain-of-thought, en espaçant les chiffres, ou en déléguant le calcul à un outil. Et le même mécanisme explique que la fenêtre et le coût se mesurent en tokens, qui varient selon la langue et le format. »</p>
+  </div>
+
+  <div class="callout cat">
+    <h3>C.A.T. — « Pourquoi le même texte coûte-t-il plus cher dans certaines langues ? »</h3>
+    <p><strong>Classify :</strong> « C'est une question d'efficacité de tokenisation selon le corpus d'entraînement. »</p>
+    <p><strong>Apply :</strong> « Le BPE apprend ses fusions sur un corpus majoritairement anglais, qu'il compresse donc bien — environ 4 caractères par token. Les scripts non latins, le code ou un JSON verbeux se découpent plus finement : le même sens peut représenter 2 à 3× plus de tokens, donc coûter et occuper la fenêtre proportionnellement. »</p>
+    <p><strong>Trap :</strong> « C'est un levier d'optimisation concret : reformuler ou minifier peut réduire le coût sans changer le sens. Et toujours compter avec le tokenizer exact du modèle, pas au mot. »</p>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- LE FIL CONDUCTEUR -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>Le fil qui relie la tokenisation au reste</h2>
+  <div class="callout ok">
+    <p>
+      <strong>La tokenisation décide de ce qu'est « n » partout ailleurs.</strong> Elle fixe le nombre
+      de tokens d'une séquence — donc le coût de l'attention en O(n²), la taille du KV cache, le prix
+      par requête et l'espace utile dans la fenêtre de contexte. Quand un examinateur demande « pourquoi
+      le contexte long est-il cher » ou « comment estimeriez-vous le coût de cette fonctionnalité »,
+      la tokenisation est toujours dans la première phrase de la réponse.
+    </p>
+  </div>
+
+  <!-- ── QUIZ ───────────────────────────────────────────────────────── -->
+  <div class="quiz">
+    <h2>Contrôle de restitution</h2>
+    <p style="color:var(--muted); font-size:0.9rem; margin-bottom:1rem;">Ne cherchez pas. Répondez de mémoire, à voix haute si possible.</p>
+
+    <div class="quiz-q" id="q1">
+      <p>1. Que fait le BPE à chaque itération ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Il supprime les tokens les moins fréquents du vocabulaire</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Il fusionne la paire de symboles adjacents la plus fréquente en un nouveau token</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Il découpe chaque mot en caractères individuels</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q2">
+      <p>2. Sur quoi le byte-level BPE (GPT-2 et suivants) démarre-t-il ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Sur le dictionnaire des mots anglais les plus fréquents</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Sur les caractères Unicode de tous les alphabets connus</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Sur les 256 octets, ce qui élimine les tokens hors-vocabulaire</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q3">
+      <p>3. Pourquoi un LLM compte-t-il mal les « r » de « strawberry » ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Le mot est hors vocabulaire et remplacé par &lt;UNK&gt;</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Un échec de raisonnement que plus de paramètres corrigerait</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Il voit des tokens de sous-mots, pas des caractères individuels</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q4">
+      <p>4. La fenêtre de contexte se mesure en…</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…caractères, comme les limites de champs traditionnelles</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">…tokens, une unité qui varie avec la langue et le format</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…mots, quelle que soit la langue du texte</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q5">
+      <p>5. Le même paragraphe traduit en chinois puis envoyé au modèle…</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…consomme exactement le même nombre de tokens</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">…consomme souvent plus de tokens, car le corpus d'entraînement était surtout anglais</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…consomme moins de tokens, les caractères étant plus compacts</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q6">
+      <p>6. Pourquoi l'arithmétique de tête est-elle peu fiable ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Les chiffres ne font pas partie du vocabulaire du modèle</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Les nombres se découpent en tokens arbitraires, sans alignement par chiffre</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Le softmax de sortie ne peut pas produire de chiffres exacts</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q7">
+      <p>7. En anglais courant, la règle de pouce pour convertir en tokens est…</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">1 token par mot, quelle que soit la longueur du mot</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">1 token par caractère, espaces compris</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Environ 4 caractères ou ¾ de mot par token</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div id="score-banner" class="score-banner"></div>
+  </div>
+
+  <!-- ── SOURCES PRIMAIRES ───────────────────────────────────────────── -->
+  <h2>Sources primaires</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/1508.07909" target="_blank">Sennrich et al. — « Neural Machine Translation of Rare Words with Subword Units »</a> (le BPE appliqué au NLP)</li>
+    <li><a href="https://openai.com/research/language-unsupervised" target="_blank">Radford et al. — GPT-2 « Language Models are Unsupervised Multitask Learners »</a> (byte-level BPE)</li>
+    <li><a href="https://arxiv.org/abs/1808.06226" target="_blank">Kudo &amp; Richardson — SentencePiece</a> (BPE / unigram pour LLaMA, T5)</li>
+    <li><a href="https://arxiv.org/abs/2405.05417" target="_blank">Land &amp; Bartolo — « Fishing for Magikarp »</a> (tokens sous-entraînés / glitch)</li>
+    <li><a href="https://github.com/openai/tiktoken" target="_blank">OpenAI — tiktoken</a> et <a href="https://tiktokenizer.vercel.app" target="_blank">Tiktokenizer</a> (compter les tokens soi-même)</li>
+  </ul>
+
+  <!-- ── ET ENSUITE ──────────────────────────────────────────────────── -->
+  <h2>Et ensuite</h2>
+  <p style="color:var(--muted); font-size:0.9rem;">
+    Dites « suivant » pour suivre le plan, ou choisissez une session :
+  </p>
+  <ul>
+    <li><strong>S05 — KV cache en profondeur :</strong> structure, calcul de mémoire, GQA/MQA, PagedAttention</li>
+    <li><strong>S18 — Scaling laws en profondeur :</strong> les maths de Chinchilla et le virage inference-optimal</li>
+    <li><a href="0004-tier1-how-llms-think-fr.html">← Leçon 4 — Vue d'ensemble du Tier 1</a></li>
+    <li><a href="0003-llm-primitives-map.html">← Retour à la Carte des primitives</a></li>
+    <li><a href="0002-interview-framework.html">← Leçon 2 — Le cadre C.A.T.</a></li>
+  </ul>
+
+  <div class="ask-teacher">
+    <strong>Posez n'importe quelle question à votre professeur.</strong> Vous voulez dérouler un exemple
+    BPE sur une phrase réelle, compter des tokens ensemble, ou répéter une réponse C.A.T. à voix haute
+    et obtenir un retour ? Dites-le simplement.
+  </div>
+
+</main>
+
+<script>
+  let answered = {};
+  const TOTAL = 7;
+  const feedbacks = {
+    correct: "Correct.",
+    wrong: "Pas tout à fait — relisez la section ci-dessus et réessayez."
+  };
+
+  function answer(btn, result) {
+    const qDiv = btn.closest('.quiz-q');
+    const qId = qDiv.id;
+    if (answered[qId]) return;
+    answered[qId] = result;
+
+    qDiv.querySelectorAll('.quiz-option').forEach(b => b.disabled = true);
+    btn.classList.add(result);
+    qDiv.querySelector('.quiz-feedback').textContent = feedbacks[result];
+
+    if (Object.keys(answered).length === TOTAL) {
+      const correct = Object.values(answered).filter(v => v === 'correct').length;
+      const banner = document.getElementById('score-banner');
+      banner.textContent = correct >= 6
+        ? `${correct}/${TOTAL} — solide. Vous savez ce que le modèle voit réellement.`
+        : `${correct}/${TOTAL} — revoyez les erreurs, puis expliquez le BPE et le piège « strawberry » à voix haute.`;
+      banner.classList.add('show', correct >= 6 ? 'pass' : 'fail');
+    }
+  }
+</script>
+</body>
+</html>

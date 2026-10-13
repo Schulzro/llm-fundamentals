@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Leçon 8 — Chain-of-thought et techniques de prompting</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <style>
+    .diagram {
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.25rem;
+      margin: 0 0 1.5rem;
+      overflow-x: auto;
+    }
+    .group-label {
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: #fff;
+      background: #1e3a5f;
+      display: inline-block;
+      padding: 0.2rem 0.6rem;
+      border-radius: 4px;
+      margin-bottom: 0.6rem;
+    }
+    .cat { border-left: 4px solid var(--ok); }
+    .cat h3 { margin-top: 0.3rem; }
+    .mono { font-family: var(--mono); font-size: 0.88rem; }
+  </style>
+</head>
+<body>
+<main>
+
+  <div class="lesson-meta">Leçon 08 · Fondamentaux des LLM · Tier 3 — Comment les LLM répondent</div>
+  <h1>Chain-of-thought et techniques de prompting</h1>
+  <p style="color:var(--muted); font-size:0.9rem; margin-bottom:2rem;">~22 min · Objectif entretien : expliquer pourquoi « penser étape par étape » marche, choisir la bonne technique de prompting selon la tâche, et éviter les pièges (CoT inutile, exemples mal choisis, instructions perdues au milieu)</p>
+
+  <!-- ── POURQUOI CE SUJET ──────────────────────────────────────────── -->
+  <div class="callout">
+    <p>
+      <strong>Un LLM n'a qu'un seul canal pour « réfléchir » : les tokens qu'il génère.</strong> Le
+      chain-of-thought (CoT) exploite ce fait — en lui demandant d'écrire le raisonnement, on lui donne
+      du temps de calcul (des pas de forward) pour arriver à la réponse. C'est la technique de prompting
+      la plus rentable, et la plus mal comprise.
+    </p>
+  </div>
+
+  <p>
+    Cette leçon couvre la primitive « Prompting Techniques » de la Carte (S08) : <strong>pourquoi la CoT
+    fonctionne</strong>, <strong>zero-shot et few-shot CoT</strong>, <strong>self-consistency</strong>,
+    puis <strong>ReAct, structured output et « lost in the middle »</strong>, avant les
+    <strong>limites et pièges</strong>.
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 1. POURQUOI LA COT MARCHE -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>1 · Pourquoi la CoT fonctionne</h2>
+  <span class="group-label">Tokens = pas de calcul · Profondeur effective</span>
+
+  <div class="callout">
+    <p>
+      <strong>Un transformer a une profondeur fixe (nombre de couches) : pour un problème à n étapes, un
+      seul forward pass n'a pas assez de « place » pour calculer. La CoT transforme le raisonnement en
+      tokens, chaque token étant un pas de calcul supplémentaire.</strong>
+    </p>
+  </div>
+
+  <p>
+    C'est une intuition centrale en entretien : le nombre de couches bornent les opérations sérielles
+    réalisables en un seul pas. En générant des étapes intermédiaires, on « déroule » le calcul sur
+    plusieurs passes auto-régressives. D'où l'observation empirique : la CoT aide surtout sur les tâches
+    à raisonnement multi-étapes (arithmétique, logique, planification) et <strong>ne sert à rien — voire
+    nuit — aux tâches de simple rappel ou de classification</strong>.
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 2. ZERO-SHOT ET FEW-SHOT COT -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>2 · Zero-shot et few-shot CoT</h2>
+  <span class="group-label">« Let's think step by step » · Exemples · Kojima · Wei</span>
+
+  <div class="callout">
+    <p>
+      <strong>Zero-shot CoT : on ajoute « Réfléchissons étape par étape » à la question. Few-shot CoT :
+      on fournit des exemples résolus montrant le raisonnement, et le modèle imite ce format.</strong>
+    </p>
+  </div>
+
+  <div class="diagram">
+    <pre><code>ZERO-SHOT CoT
+  Q: « Roger a 5 balles, en achète 2 boîtes de 3. Combien ? »
+  + « Réfléchissons étape par étape. »
+  → 5 + 2×3 = 5 + 6 = 11
+
+FEW-SHOT CoT
+  Exemple 1 : Q … « Étape 1 : … Étape 2 : … Réponse : 11 »
+  Exemple 2 : Q … « Étape 1 : … Étape 2 : … Réponse : 4 »
+  Question réelle → le modèle reproduit le format raisonné</code></pre>
+  </div>
+  <p>
+    Le few-shot CoT est plus fiable mais coûte des tokens d'exemples à chaque appel. Le zero-shot CoT est
+    gratuit mais plus fragile. Dans les deux cas, le <strong>format des exemplaires compte plus que leur
+    contenu</strong> : ils enseignent au modèle <em>comment</em> raisonner, pas <em>quoi</em> répondre.
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 3. SELF-CONSISTENCY -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>3 · Self-consistency : l'échantillonnage au service du raisonnement</h2>
+  <span class="group-label">Multiple chemins · Vote majoritaire</span>
+
+  <div class="callout">
+    <p>
+      <strong>Au lieu d'un seul chemin de raisonnement, on échantillonne plusieurs (temperature &gt; 0)
+      et on prend la réponse majoritaire — les chemins divergents se rejoignent souvent sur la bonne
+      réponse.</strong>
+    </p>
+  </div>
+  <p>
+    La self-consistency (Wang et al.) connecte directement la leçon S07 : on utilise une
+    <strong>temperature élevée pour diversifier les raisonnements</strong>, puis on agrège par vote
+    majoritaire sur la réponse finale (pas sur le raisonnement). Coût multiplié par le nombre
+    d'échantillons, donc à réserver aux tâches où l'exactitude vaut le surcoût.
+  </p>
+  <div class="callout warn">
+    <p>
+      <strong>Piège :</strong> la self-consistency n'est pas un contrôle de vérité. Si le modèle partage
+      un biais systématique, tous les chemins convergent vers la même erreur — le vote ne fait que
+      renforcer la confiance dans le faux.
+    </p>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 4. REACT / STRUCTURED OUTPUT / LOST IN THE MIDDLE -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>4 · Au-delà de la CoT : ReAct, sortie structurée, « lost in the middle »</h2>
+  <span class="group-label">Reason + Act · JSON schema · Position dans le contexte</span>
+
+  <table>
+    <thead>
+      <tr><th>Technique</th><th>Idée</th><th>Quand l'utiliser</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>ReAct</strong></td>
+        <td>Alterner raisonnement (Reason) et appel d'outil (Act), en boucle</td>
+        <td>Tâches agentiques : recherche, calcul, API (voir S14)</td>
+      </tr>
+      <tr>
+        <td><strong>Structured output</strong></td>
+        <td>Contraindre la sortie à un schéma JSON / grammaire</td>
+        <td>Intégration machine, extraction fiable de champs</td>
+      </tr>
+      <tr>
+        <td><strong>Least-to-most</strong></td>
+        <td>Décomposer en sous-problèmes, résoudre du plus simple au plus dur</td>
+        <td>Problèmes composables, généralisation à plus dur que les exemples</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <p>
+      <strong>« Lost in the middle » :</strong> les informations placées au <em>milieu</em> d'un long
+      contexte sont moins bien exploitées qu'au début ou à la fin (effet de position en U). Conséquence
+      pratique : mettez les instructions critiques et les documents décisifs au <strong>début</strong>
+      ou à la <strong>fin</strong> du prompt, jamais enterrés au centre — et rappelez la consigne
+      importante juste avant la génération.
+    </p>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 5. LIMITES ET PIÈGES -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>5 · Limites et pièges d'entretien</h2>
+  <table>
+    <thead>
+      <tr><th>Piège</th><th>La bonne réponse</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>« La CoT améliore tout »</td>
+        <td>Non : elle aide sur le multi-étapes et peut dégrader les tâches simples (latence, tokens, dérive).</td>
+      </tr>
+      <tr>
+        <td>« La CoT révèle le vrai raisonnement du modèle »</td>
+        <td>Non : le texte écrit n'est pas forcément la cause du résultat — la <em>faithfulness</em> de la CoT est limitée.</td>
+      </tr>
+      <tr>
+        <td>« Il suffit de dire step by step »</td>
+        <td>Efficace souvent, mais fragile : le format d'exemples few-shot est bien plus fiable.</td>
+      </tr>
+      <tr>
+        <td>« La self-consistency garantit la bonne réponse »</td>
+        <td>Non : elle amplifie le biais systématique si tous les chemins se trompent pareil.</td>
+      </tr>
+      <tr>
+        <td>« Plus de contexte = mieux »</td>
+        <td>Non : « lost in the middle » — la position compte autant que la quantité.</td>
+      </tr>
+      <tr>
+        <td>« On peut toujours faire confiance au format »</td>
+        <td>Non : sans sortie contrainte, le modèle peut casser le format (JSON invalide) — d'où les schémas.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- C.A.T. -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <div class="callout cat">
+    <h3>C.A.T. — « Pourquoi le chain-of-thought améliore-t-il les performances ? »</h3>
+    <p><strong>Classify :</strong> « C'est une technique de prompting qui exploite la génération auto-régressive comme temps de calcul. »</p>
+    <p><strong>Apply :</strong> « Un transformer a une profondeur fixe, donc un seul forward pass ne peut pas réaliser un raisonnement à plusieurs étapes. En demandant d'écrire les étapes, chaque token généré devient un pas de calcul en plus : le modèle dispose de plus de « place » pour résoudre le problème. D'où le gain net sur l'arithmétique, la logique et la planification. »</p>
+    <p><strong>Trap :</strong> « Les deux pièges : croire que ça aide partout — sur une tâche simple c'est du coût pur — et croire que le texte affiché est le vrai raisonnement interne. Sa faithfulness est limitée. »</p>
+  </div>
+
+  <div class="callout cat">
+    <h3>C.A.T. — « Comment obtirez-vous un raisonnement fiable et une réponse exploitable par la machine ? »</h3>
+    <p><strong>Classify :</strong> « C'est un problème de prompting à la fois pour la qualité du raisonnement et pour le format de sortie. »</p>
+    <p><strong>Apply :</strong> « Je pars sur du few-shot CoT pour montrer le format de raisonnement, puis je contrains la sortie à un schéma JSON pour que la réponse finale soit parsable. Si l'exactitude est critique, j'ajoute de la self-consistency : plusieurs chemins, vote majoritaire sur le champ réponse. Je place aussi les instructions et documents décisifs en début ou fin de contexte à cause de l'effet lost-in-the-middle. »</p>
+    <p><strong>Trap :</strong> « Le piège serait de vouloir maximiser la CoT partout. Sur une extraction simple, elle ajoute latence et tokens et peut dériver : là, une sortie structurée directe est meilleure. »</p>
+  </div>
+
+  <!-- ── QUIZ ───────────────────────────────────────────────────────── -->
+  <div class="quiz">
+    <h2>Contrôle de restitution</h2>
+    <p style="color:var(--muted); font-size:0.9rem; margin-bottom:1rem;">Ne cherchez pas. Répondez de mémoire, à voix haute si possible.</p>
+
+    <div class="quiz-q" id="q1">
+      <p>1. Pourquoi la CoT aide-t-elle ?</p>
+      <button class="quiz-option" onclick="answer(this,'correct')">Elle transforme le raisonnement en tokens, donnant au modèle des pas de calcul supplémentaires</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Elle augmente le nombre de couches du transformer</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Elle récupère des faits dans une base de connaissances</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q2">
+      <p>2. Quelle est la différence entre zero-shot et few-shot CoT ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Zero-shot nécessite un fine-tuning</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Zero-shot ajoute une invite (« étape par étape ») ; few-shot fournit des exemples de raisonnement</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Few-shot n'utilise qu'un seul exemple par définition</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q3">
+      <p>3. Que fait la self-consistency ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Elle force un raisonnement unique déterministe</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Elle échantillonne plusieurs raisonnements et prend la réponse majoritaire</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Elle vérifie les faits contre une source externe</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q4">
+      <p>4. Sur quel type de tâche la CoT nuit-elle ou n'apporte-t-elle rien ?</p>
+      <button class="quiz-option" onclick="answer(this,'correct')">Les tâches simples : rappel direct, classification basique</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Les problèmes d'arithmétique à plusieurs étapes</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">La planification complexe</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q5">
+      <p>5. Le texte de raisonnement d'une CoT est-il fidèle au calcul interne du modèle ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Oui, toujours</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Pas nécessairement — la faithfulness de la CoT est limitée</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Oui, car chaque token est un pas de calcul exact</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q6">
+      <p>6. Que décrit l'effet « lost in the middle » ?</p>
+      <button class="quiz-option" onclick="answer(this,'correct')">L'information au milieu d'un long contexte est moins bien utilisée qu'au début ou à la fin</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Le milieu du prompt est toujours le plus important</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Le modèle oublie les derniers tokens générés</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q7">
+      <p>7. À quoi sert une sortie structurée (JSON schema) ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">À accélérer la génération</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">À contraindre la sortie pour la rendre fiable et parsable par la machine</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">À réduire la fenêtre de contexte</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div id="score-banner" class="score-banner"></div>
+  </div>
+
+  <!-- ── SOURCES PRIMAIRES ───────────────────────────────────────────── -->
+  <h2>Sources primaires</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2201.11903" target="_blank">Wei et al. — « Chain-of-Thought Prompting Elicits Reasoning in Large Language Models »</a></li>
+    <li><a href="https://arxiv.org/abs/2205.11916" target="_blank">Kojima et al. — « Large Language Models are Zero-Shot Reasoners »</a> (zero-shot CoT)</li>
+    <li><a href="https://arxiv.org/abs/2203.11171" target="_blank">Wang et al. — « Self-Consistency Improves Chain of Thought Reasoning »</a></li>
+    <li><a href="https://arxiv.org/abs/2210.03629" target="_blank">Yao et al. — « ReAct : Synergizing Reasoning and Acting in Language Models »</a></li>
+    <li><a href="https://arxiv.org/abs/2307.03172" target="_blank">Liu et al. — « Lost in the Middle : How Language Models Use Long Contexts »</a></li>
+  </ul>
+
+  <!-- ── ET ENSUITE ──────────────────────────────────────────────────── -->
+  <h2>Et ensuite</h2>
+  <p style="color:var(--muted); font-size:0.9rem;">
+    Dites « suivant » pour suivre le plan, ou choisissez une session :
+  </p>
+  <ul>
+    <li><strong>S09 — RLHF :</strong> reward model, PPO, contrainte KL (Tier 2)</li>
+    <li><a href="0007-decoding-sampling-fr.html">S07 — Décodage :</a> temperature et échantillonnage, la base de la self-consistency</li>
+    <li><a href="0003-llm-primitives-map.html">← Retour à la Carte des primitives</a></li>
+    <li><a href="0002-interview-framework.html">← Leçon 2 — Le cadre C.A.T.</a></li>
+  </ul>
+
+  <div class="ask-teacher">
+    <strong>Posez n'importe quelle question à votre professeur.</strong> Vous voulez construire un prompt
+    few-shot sur votre tâche, comparer CoT et réponse directe sur un exemple, ou répéter une réponse
+    C.A.T. à voix haute ? Dites-le simplement.
+  </div>
+
+</main>
+
+<script>
+  let answered = {};
+  const TOTAL = 7;
+  const feedbacks = {
+    correct: "Correct.",
+    wrong: "Pas tout à fait — relisez la section ci-dessus et réessayez."
+  };
+
+  function answer(btn, result) {
+    const qDiv = btn.closest('.quiz-q');
+    const qId = qDiv.id;
+    if (answered[qId]) return;
+    answered[qId] = result;
+
+    qDiv.querySelectorAll('.quiz-option').forEach(b => b.disabled = true);
+    btn.classList.add(result);
+    qDiv.querySelector('.quiz-feedback').textContent = feedbacks[result];
+
+    if (Object.keys(answered).length === TOTAL) {
+      const correct = Object.values(answered).filter(v => v === 'correct').length;
+      const banner = document.getElementById('score-banner');
+      banner.textContent = correct >= 6
+        ? `${correct}/${TOTAL} — solide. Vous savez quand la CoT aide et quand elle coûte.`
+        : `${correct}/${TOTAL} — revoyez les erreurs, puis expliquez pourquoi la CoT est un temps de calcul et quand elle nuit.`;
+      banner.classList.add('show', correct >= 6 ? 'pass' : 'fail');
+    }
+  }
+</script>
+</body>
+</html>

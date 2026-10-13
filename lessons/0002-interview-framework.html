@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 2 — The Interview Framework</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<main>
+
+  <div class="lesson-meta">Lesson 02 · LLM Fundamentals · Interview Skills</div>
+  <h1>The Interview Framework: Answer in 60s, Signal Depth</h1>
+  <p style="color:var(--muted); font-size:0.9rem; margin-bottom:2rem;">~15 min · Applies to every LLM technical question, not just caching</p>
+
+  <!-- ── THE PROBLEM ─────────────────────────────────────────────────── -->
+  <h2>The problem with most technical answers</h2>
+
+  <p>Two failure modes in applied AI interviews:</p>
+  <ul>
+    <li><strong>Too shallow</strong> — "I'd use prompt caching to save money." Full stop. No mechanism, no tradeoff, no signal that you've shipped this.</li>
+    <li><strong>Too deep, too fast</strong> — You spend 3 minutes on TTL math before the interviewer has understood the basic concept. You lose them and run out of time.</li>
+  </ul>
+
+  <p>
+    What you want: a tight core answer the interviewer can follow in 45 seconds,
+    followed by a single signal sentence that invites them to go deeper <em>if they want to</em>.
+    You control the depth dial. They decide whether to turn it.
+  </p>
+
+  <!-- ── THE FRAMEWORK ───────────────────────────────────────────────── -->
+  <h2>The framework: C.A.T.</h2>
+
+  <div class="callout">
+    <p>
+      <strong>C — Classify</strong> the type of problem (what LLM primitive does this map to?)<br>
+      <strong>A — Apply</strong> the mechanism to their specific scenario (the what and the how)<br>
+      <strong>T — Trap</strong> one gotcha or tradeoff (signals you've hit this in production)
+    </p>
+  </div>
+
+  <p>
+    Three moves, in order, in 60 seconds. The Trap is what separates candidates who've read the docs
+    from candidates who've shipped the thing. It's the sentence that makes the interviewer lean forward.
+  </p>
+
+  <p>
+    After T, you pause. If they want more, you have a full depth map ready.
+    But you don't unload it unprompted.
+  </p>
+
+  <!-- ── THE DEPTH MAP ───────────────────────────────────────────────── -->
+  <h2>The depth map — what lives behind each answer</h2>
+
+  <p>
+    Every good technical answer has three layers. Know all three.
+    Deliver layer 1 by default. Signal layer 2 briefly. Keep layer 3 in your pocket.
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Layer</th><th>What it is</th><th>When to surface it</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>1 — Mechanism</strong></td>
+        <td>How it works (the invariant, the API, the basic flow)</td>
+        <td>Always — this is your core answer</td>
+      </tr>
+      <tr>
+        <td><strong>2 — Tradeoff</strong></td>
+        <td>When it helps vs hurts, cost/latency implications</td>
+        <td>Your "Trap" sentence; expand if they probe</td>
+      </tr>
+      <tr>
+        <td><strong>3 — Edge case</strong></td>
+        <td>Silent invalidators, minimum token thresholds, concurrent-request timing</td>
+        <td>Only when they ask "what could go wrong?" or "how would you debug it?"</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ── WORKED EXAMPLE ─────────────────────────────────────────────── -->
+  <h2>Worked example: the handbook chatbot question</h2>
+
+  <p style="background:var(--code-bg); border:1px solid var(--border); border-radius:6px; padding:1rem; font-style:italic; margin-bottom:1.5rem;">
+    "You're building a chatbot that helps users analyze their 50-page company handbook,
+    and users ask various questions about it throughout their session.
+    How would prompt caching help here, and what part of your prompt would you actually want to cache?"
+  </p>
+
+  <h3>Step 1 — Classify</h3>
+  <p>
+    This is a <strong>large shared context + variable queries</strong> pattern.
+    One expensive static document, many cheap dynamic questions.
+    That's the textbook use case for prompt caching — cache the document, not the questions.
+  </p>
+
+  <h3>Step 2 — Apply</h3>
+  <p>
+    Place the handbook as a content block early in the prompt — in the system prompt or as
+    the first user message — and mark a <code>cache_control</code> breakpoint at its end.
+    Leave it byte-identical across every request. Each user question sits after the breakpoint
+    and is processed fresh. The expensive KV computation of processing the handbook is stored
+    and replayed from cache — you pay ~10% of the normal cost to reuse it, rather than reprocessing
+    it from scratch. The handbook bytes still travel in every request; what's cached is the
+    <em>computation</em>, not model memory (the model is stateless per request).
+  </p>
+
+  <h3>Step 3 — Trap</h3>
+  <p>
+    "The one thing that kills this silently is injecting anything dynamic into the cached block —
+    a timestamp, the user's name, the current date. One dynamic byte before the breakpoint and
+    every request pays full price with no error to tell you."
+  </p>
+
+  <div class="callout ok">
+    <p><strong>The full 60-second answer, spoken:</strong></p>
+    <p>
+      "This is a large-static-context plus variable-queries pattern — textbook caching territory.
+      I'd put the handbook in the system prompt with a cache breakpoint at the end, and keep it
+      frozen for the session. Every question the user asks sits after that breakpoint and gets
+      processed fresh, but the 40,000-token handbook is served from cache at about one-tenth the cost.
+      The gotcha is anything dynamic in the cached block — a date, a user ID, even a reordered JSON key —
+      silently invalidates it. So I'd keep the handbook completely static and push all
+      personalization into the message turns."
+    </p>
+  </div>
+
+  <p>
+    Then stop. The interviewer now knows you understand the mechanism, the application, and a real
+    failure mode. If they want the TTL math, the minimum token threshold, or how to debug a miss —
+    they'll ask. And you have all of it ready.
+  </p>
+
+  <!-- ── WHAT SIGNALS DEPTH ───────────────────────────────────────────── -->
+  <h2>What signals depth (without over-explaining)</h2>
+
+  <p>Four language moves that make you sound like you've shipped this:</p>
+
+  <table>
+    <thead>
+      <tr><th>Instead of…</th><th>Say…</th><th>Why it works</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>"It saves money"</td>
+        <td>"cache reads cost ~0.1× base input price"</td>
+        <td>Quantification shows you know the economics</td>
+      </tr>
+      <tr>
+        <td>"You need a big prompt"</td>
+        <td>"there's a model-dependent minimum — usually 1K tokens — below which it silently does nothing"</td>
+        <td>"silently does nothing" signals you've been burned</td>
+      </tr>
+      <tr>
+        <td>"It might not work"</td>
+        <td>"I'd verify by checking <code>cache_read_input_tokens</code> in the usage object"</td>
+        <td>Names the exact diagnostic — shows you know how to debug it</td>
+      </tr>
+      <tr>
+        <td>"You should cache the static parts"</td>
+        <td>"the invariant is: stable content must physically precede volatile content in the rendered prompt"</td>
+        <td>States the rule, not just the instance</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ── PRACTICE: MORE QUESTION TYPES ──────────────────────────────── -->
+  <h2>Recognizing question types — classify fast</h2>
+
+  <p>
+    The Classify step is fastest when you have a mental map of recurring patterns.
+    These are the four prompt caching question types you'll see:
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Pattern</th><th>Signal words in the question</th><th>Your classify sentence</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Large static context + variable queries</td>
+        <td>"handbook", "document", "knowledge base", "50 pages"</td>
+        <td>"This is a large shared context pattern — cache the document, not the queries."</td>
+      </tr>
+      <tr>
+        <td>Multi-turn conversation</td>
+        <td>"chatbot", "conversation history", "turns", "session"</td>
+        <td>"This is incremental conversation caching — each turn extends the cached prefix."</td>
+      </tr>
+      <tr>
+        <td>Few-shot examples shared across requests</td>
+        <td>"same examples", "consistent formatting", "10 examples every time"</td>
+        <td>"This is shared prefix caching — cache the examples, vary only the input."</td>
+      </tr>
+      <tr>
+        <td>Debugging a cache miss</td>
+        <td>"not working", "still expensive", "cache_read_input_tokens is zero"</td>
+        <td>"This is a silent invalidator hunt — diff the rendered bytes between two requests."</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ── QUIZ ───────────────────────────────────────────────────────── -->
+  <div class="quiz">
+    <h2>Practice: classify and frame</h2>
+    <p style="color:var(--muted); font-size:0.9rem; margin-bottom:1rem;">For each question, pick the best opening move.</p>
+
+    <div class="quiz-q" id="q1">
+      <p>1. "We're sending the same 20 few-shot examples with every API request. Any optimizations?" — Your first sentence should…</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">"The main issue is your token count is probably too high."</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">"This is a shared-prefix pattern — cache the examples, vary only the input."</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">"You should look into fine-tuning instead of few-shot prompting."</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q2">
+      <p>2. The interviewer asks "what could go wrong?" after your answer. You should…</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Repeat your answer more slowly and clearly.</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Ask them to clarify what specifically they're worried about.</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Move to Layer 3 — name one specific silent invalidator with its fix.</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q3">
+      <p>3. "Our caching isn't working even though the prompts look the same." Best classify sentence:</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">"Caching probably isn't supported on your model yet."</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">"This is a silent invalidator problem — diff the rendered bytes between two requests."</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">"You might need to increase your cache TTL to 1 hour."</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q4">
+      <p>4. You finish your answer in 50 seconds. The interviewer says nothing. You should…</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Fill the silence by going into Layer 3 edge cases unprompted.</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Stop and hold the silence — you've done your job, let them drive.</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Ask "was that enough detail?" to show self-awareness.</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div id="score-banner" class="score-banner"></div>
+  </div>
+
+  <!-- ── THE CHEAT SHEET ─────────────────────────────────────────────── -->
+  <h2>The one-card cheat sheet</h2>
+
+  <div class="callout">
+    <p><strong>C — Classify:</strong> Name the pattern in one sentence. ("This is a large-static-context pattern.")</p>
+    <p><strong>A — Apply:</strong> Tell them what you'd do and why, specifically. 2–3 sentences max.</p>
+    <p><strong>T — Trap:</strong> Name one real failure mode. "The gotcha is…" Then stop.</p>
+    <p style="margin-top:0.75rem; color:var(--muted);">Depth map: Layer 1 (mechanism) always. Layer 2 (tradeoff) briefly. Layer 3 (edge case) only when probed.</p>
+  </div>
+
+  <!-- ── WHAT'S NEXT ─────────────────────────────────────────────────── -->
+  <h2>What's next</h2>
+  <ul>
+    <li><a href="0001-prompt-caching-the-core-invariant.html">← Lesson 1 — The Core Invariant</a></li>
+    <li><a href="0003-silent-invalidators.html">Lesson 3 — Silent Invalidators (the full list, with code)</a></li>
+  </ul>
+
+  <div class="ask-teacher">
+    <strong>Ask your teacher anything.</strong> Want to practice the C.A.T. framework on another question?
+    Want a harder scenario? Ask — the agent will respond.
+  </div>
+
+</main>
+
+<script>
+  let answered = {};
+  const feedbacks = {
+    correct: "Correct.",
+    wrong: "Not quite — re-read the section above and try again."
+  };
+
+  function answer(btn, result) {
+    const qDiv = btn.closest('.quiz-q');
+    const qId = qDiv.id;
+    if (answered[qId]) return;
+    answered[qId] = result;
+
+    qDiv.querySelectorAll('.quiz-option').forEach(b => b.disabled = true);
+    btn.classList.add(result);
+    qDiv.querySelector('.quiz-feedback').textContent = feedbacks[result];
+
+    if (Object.keys(answered).length === 4) {
+      const correct = Object.values(answered).filter(v => v === 'correct').length;
+      const banner = document.getElementById('score-banner');
+      banner.textContent = correct === 4
+        ? `${correct}/4 — clean. The framework is yours.`
+        : `${correct}/4 — review the misses, then try framing one answer out loud.`;
+      banner.classList.add('show', correct >= 3 ? 'pass' : 'fail');
+    }
+  }
+</script>
+</body>
+</html>

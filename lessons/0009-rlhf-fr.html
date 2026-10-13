@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Leçon 9 — RLHF : reward model, PPO et contrainte KL</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <style>
+    .diagram {
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.25rem;
+      margin: 0 0 1.5rem;
+      overflow-x: auto;
+    }
+    .group-label {
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: #fff;
+      background: #1e3a5f;
+      display: inline-block;
+      padding: 0.2rem 0.6rem;
+      border-radius: 4px;
+      margin-bottom: 0.6rem;
+    }
+    .cat { border-left: 4px solid var(--ok); }
+    .cat h3 { margin-top: 0.3rem; }
+    .mono { font-family: var(--mono); font-size: 0.88rem; }
+  </style>
+</head>
+<body>
+<main>
+
+  <div class="lesson-meta">Leçon 09 · Fondamentaux des LLM · Tier 2 — Comment les LLM apprennent</div>
+  <h1>RLHF : reward model, PPO et contrainte KL</h1>
+  <p style="color:var(--muted); font-size:0.9rem; margin-bottom:2rem;">~24 min · Objectif entretien : dérouler le pipeline d'alignement (SFT → RM → RL), expliquer le rôle de la contrainte KL, et nommer les pièges (reward hacking, instabilité, coût)</p>
+
+  <!-- ── POURQUOI CE SUJET ──────────────────────────────────────────── -->
+  <div class="callout">
+    <p>
+      <strong>RLHF est ce qui transforme un modèle de complétion en assistant qui suit les
+      instructions.</strong> C'est la réponse à « comment le modèle a-t-il appris à être utile, honnête
+      et inoffensif ? ». En entretien, c'est le sujet d'alignement le plus demandé — et celui où l'on
+      distingue ceux qui connaissent l'acronyme de ceux qui savent pourquoi la contrainte KL existe.
+    </p>
+  </div>
+
+  <p>
+    Cette leçon couvre la primitive « Alignment » de la Carte (S09) : <strong>le pipeline en trois
+    étapes</strong>, <strong>le reward model appris sur des préférences</strong>, <strong>PPO et la
+    fonction objectif RLHF</strong>, puis <strong>la contrainte KL</strong> et ses raisons, avant les
+    <strong>limites et le pont vers DPO</strong> (S10).
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 1. LE PIPELINE EN 3 ÉTAPES -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>1 · Le pipeline d'alignement en trois étapes</h2>
+  <span class="group-label">Pré-entraînement → SFT → RM → RL</span>
+
+  <div class="diagram">
+    <pre><code>1. PRÉ-ENTRAÎNEMENT   next-token prediction sur du texte brut      → modèle de base
+2. SFT                fine-tuning supervisé sur démonstrations      → modèle « instruct »
+3. REWARD MODEL       appris sur comparaisons de paires             → r_φ(x, y)
+4. RL (PPO)           la politique maximise r_φ − β·KL              → modèle final</code></pre>
+  </div>
+
+  <p>
+    Le pré-entraînement donne la <em>compétence</em> (prédire le token suivant), mais pas
+    l'<em>obéissance</em>. Le SFT (Supervised Fine-Tuning) apprend le format « réponse à une
+    instruction » à partir de démonstrations humaines. Mais le SFT est limité par le volume et la
+    qualité des démonstrations écrites. Le RLHF contourne ce plafond : <strong>comparer deux réponses
+    est bien plus facile et plus fiable, pour un humain, que d'en rédiger une bonne</strong>.
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 2. LE REWARD MODEL -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>2 · Le reward model : apprendre à partir de préférences</h2>
+  <span class="group-label">Paires (choisie, rejetée) · Bradley-Terry</span>
+
+  <div class="callout">
+    <p>
+      <strong>On montre à des annotateurs deux réponses à la même instruction et on leur demande laquelle
+      est la meilleure. Un modèle de récompense apprend à prédire ces préférences, et sert ensuite de
+      « juge » automatique pour l'entraînement RL.</strong>
+    </p>
+  </div>
+
+  <p>
+    Le RM prend une paire (x, y) et renvoie un score scalaire r_φ(x, y). On l'entraîne sur des triplets
+    (x, y_choisie, y_rejetée) avec une perte de type Bradley-Terry, qui pousse le score de la réponse
+    préférée au-dessus de celui de la rejetée :
+  </p>
+  <div class="diagram">
+    <pre><code>L(φ) = − log σ( r_φ(x, y_w) − r_φ(x, y_l) )
+
+  y_w = réponse préférée (winner)
+  y_l = réponse rejetée   (loser)
+  σ   = sigmoïde
+
+Interprétation : différence de scores ↦ probabilité de préférence.
+Le RM est un classifieur de préférences, pas un juge de vérité.</code></pre>
+  </div>
+  <div class="callout warn">
+    <p>
+      <strong>Le RM n'est qu'un proxy.</strong> Il apprend ce que les annotateurs <em>préfèrent</em>,
+      avec leurs biais (longueur, style, sycophantie). Optimiser trop fort contre ce proxy — c'est le
+      <strong>reward hacking</strong> — donne un modèle qui exploite les failles du RM plutôt que de
+      devenir réellement meilleur (loi de Goodhart).
+    </p>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 3. PPO ET LA FONCTION OBJECTIF -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>3 · PPO et la fonction objectif RLHF</h2>
+  <span class="group-label">Politique · Récompense · Pénalité KL</span>
+
+  <div class="callout">
+    <p>
+      <strong>PPO (Proximal Policy Optimization) ajuste la politique — ici le LLM — pour maximiser la
+      récompense du RM tout en restant proche du modèle de référence, via une pénalité KL.</strong>
+    </p>
+  </div>
+
+  <div class="diagram">
+    <pre><code>Objectif RLHF :
+
+  E_{x∼D, y∼π_θ}[ r_φ(x, y) ]  −  β · KL( π_θ(y|x) ‖ π_ref(y|x) )
+  └──── maximiser la récompense ────┘   └── rester proche du modèle de référence ──┘
+
+  π_θ      = politique entraînée (le LLM, mis à jour)
+  π_ref    = modèle de référence figé (souvent la version SFT)
+  r_φ      = reward model figé
+  β        = coefficient de la contrainte KL</code></pre>
+  </div>
+  <p>
+    Trois modèles sont donc en mémoire pendant le RLHF : la <strong>politique</strong> (entraînée), le
+    <strong>modèle de référence</strong> (figé, pour le KL) et le <strong>reward model</strong> (figé,
+    pour le score). C'est ce qui rend le RLHF si coûteux en calcul et instable à régler — et ce qui
+    motive DPO (S10).
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 4. LA CONTRAINTE KL -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>4 · La contrainte KL : pourquoi elle est indispensable</h2>
+  <span class="group-label">Éviter la dérive · Récompense imparfaite</span>
+
+  <div class="callout">
+    <p>
+      <strong>La pénalité KL empêche la politique de s'éloigner trop du modèle de référence — car le
+      reward model n'est qu'une approximation, et l'exploiter sans limite détruit le modèle.</strong>
+    </p>
+  </div>
+  <p>
+    Sans elle, la politique optimiserait agressivement un RM imparfait : elle trouverait des réponses que
+    le RM surévalue (répétitions flatteuses, formulations sycophantes, sorties dégénérées) tout en
+    s'éloignant d'un langage cohérent. La contrainte KL agit comme un <strong>ancrage</strong> :
+  </p>
+  <ul>
+    <li><strong>β faible</strong> → la politique dérive, récompense élevée mais texte dégradé (reward hacking).</li>
+    <li><strong>β élevé</strong> → la politique reste sûre mais apprend peu (reste proche du SFT).</li>
+  </ul>
+  <p>
+    Trouver le bon β est un compromis central du RLHF : c'est le curseur entre « optimiser la préférence »
+    et « rester un modèle de langage sain ».
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 5. LIMITES ET PONT VERS DPO -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>5 · Limites du RLHF et pont vers DPO</h2>
+  <table>
+    <thead>
+      <tr><th>Limite</th><th>Conséquence</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Trois modèles en mémoire, échantillonnage intensif</td>
+        <td>Coûteux, lent, gourmand en GPU</td>
+      </tr>
+      <tr>
+        <td>PPO est sensible aux hyperparamètres (β, taux, clipping)</td>
+        <td>Instabilité, besoin d'expertise</td>
+      </tr>
+      <tr>
+        <td>Le RM est un proxy biaisé</td>
+        <td>Reward hacking, biais de longueur / sycophantie</td>
+      </tr>
+      <tr>
+        <td>Préférences humaines coûteuses et bruitées</td>
+        <td>Annotations lentes, qualité variable (→ RLAIF / préférences IA)</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="callout">
+    <p>
+      <strong>Vers DPO (S10) :</strong> l'idée clé est qu'on peut réécrire l'objectif RLHF pour
+      <em>court-circuiter</em> le reward model et le RL : DPO apprend directement sur les préférences
+      (paires) avec une perte supervisée, sans politique, sans RM séparé, sans PPO. On garde l'esprit de
+      la contrainte KL, mais on élimine l'instabilité et le coût.
+    </p>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 6. PIÈGES -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>6 · Les pièges d'entretien</h2>
+  <table>
+    <thead>
+      <tr><th>Piège</th><th>La bonne réponse</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>« Le RLHF enseigne des faits au modèle »</td>
+        <td>Non : il façonne le comportement (utilité, refus, style). La connaissance vient du pré-entraînement.</td>
+      </tr>
+      <tr>
+        <td>« Le reward model dit la vérité »</td>
+        <td>Non : c'est un proxy des préférences humaines, biaisé et exploitable.</td>
+      </tr>
+      <tr>
+        <td>« La pénalité KL est un détail régularisateur »</td>
+        <td>Non : sans elle, reward hacking et effondrement du langage.</td>
+      </tr>
+      <tr>
+        <td>« PPO est stable et facile »</td>
+        <td>Non : c'est réputé instable, coûteux, sensible aux réglages — la raison d'être de DPO.</td>
+      </tr>
+      <tr>
+        <td>« RLHF remplace le SFT »</td>
+        <td>Non : il vient <em>après</em> le SFT, sur un modèle déjà instruct.</td>
+      </tr>
+      <tr>
+        <td>« Reward hacking = bug d'implémentation »</td>
+        <td>Non : c'est structurel — optimiser un proxy imparfait finit par le contourner (Goodhart).</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- C.A.T. -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <div class="callout cat">
+    <h3>C.A.T. — « Expliquez RLHF de bout en bout. »</h3>
+    <p><strong>Classify :</strong> « C'est la dernière étape d'alignement, qui apprend au modèle à suivre les instructions à partir de préférences humaines. »</p>
+    <p><strong>Apply :</strong> « On part du modèle pré-entraîné, puis SFT sur des démonstrations pour obtenir un modèle instruct. Ensuite on collecte des comparaisons de paires et on entraîne un reward model avec une perte Bradley-Terry à maximiser la différence de score entre réponse préférée et rejetée. Enfin PPO ajuste la politique pour maximiser la récompense du RM, avec une pénalité KL qui l'ancre au modèle de référence. »</p>
+    <p><strong>Trap :</strong> « Le point clé est la contrainte KL : le reward model est un proxy imparfait, donc sans elle la politique le « hack » — réponses dégénérées que le RM surévalue. C'est aussi pour ça que PPO est coûteux et instable, ce qui motive DPO. »</p>
+  </div>
+
+  <div class="callout cat">
+    <h3>C.A.T. — « Pourquoi la contrainte KL dans l'objectif RLHF ? »</h3>
+    <p><strong>Classify :</strong> « C'est un terme de régularisation qui limite l'écart entre la politique et le modèle de référence. »</p>
+    <p><strong>Apply :</strong> « Le reward model n'est qu'une approximation des préférences. Si on optimise la récompense sans frein, la politique s'éloigne du langage naturel et exploite les angles morts du RM : répétitions, flatterie, sorties incohérentes que le RM surévalue. La pénalité β·KL maintient la politique dans une région où ses sorties restent du langage sain. β contrôle directement ce compromis. »</p>
+    <p><strong>Trap :</strong> « Le piège serait de la voir comme cosmétique. Trop faible, on obtient du reward hacking ; trop forte, le modèle n'apprend presque rien. C'est le réglage le plus délicat du RLHF. »</p>
+  </div>
+
+  <!-- ── QUIZ ───────────────────────────────────────────────────────── -->
+  <div class="quiz">
+    <h2>Contrôle de restitution</h2>
+    <p style="color:var(--muted); font-size:0.9rem; margin-bottom:1rem;">Ne cherchez pas. Répondez de mémoire, à voix haute si possible.</p>
+
+    <div class="quiz-q" id="q1">
+      <p>1. Quel est l'ordre correct du pipeline d'alignement ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">SFT → pré-entraînement → PPO → RM</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Pré-entraînement → SFT → reward model → RL (PPO)</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Reward model → pré-entraînement → SFT → PPO</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q2">
+      <p>2. Sur quoi est entraîné le reward model ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Sur des réponses parfaites écrites par des experts</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Sur des préférences entre paires de réponses (choisie vs rejetée)</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Sur la perte de prédiction du token suivant</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q3">
+      <p>3. Que fait PPO dans le RLHF ?</p>
+      <button class="quiz-option" onclick="answer(this,'correct')">Il ajuste la politique pour maximiser la récompense du RM avec une pénalité KL</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Il rédige les démonstrations du SFT</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Il entraîne le modèle de pré-entraînement</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q4">
+      <p>4. À quoi sert la contrainte KL ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">À accélérer l'entraînement</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">À empêcher la politique de trop s'éloigner du modèle de référence, car le RM est imparfait</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">À supprimer le besoin de SFT</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q5">
+      <p>5. Que se passe-t-il si β (coefficient KL) est trop faible ?</p>
+      <button class="quiz-option" onclick="answer(this,'correct')">La politique dérive et exploite le RM — reward hacking</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">La politique reste identique au modèle de référence</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Le reward model s'entraîne plus vite</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q6">
+      <p>6. Le RLHF enseigne-t-il de nouveaux faits au modèle ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Oui, c'est sa fonction principale</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Non — il façonne le comportement ; la connaissance vient du pré-entraînement</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Oui, via le reward model</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q7">
+      <p>7. Combien de modèles sont en jeu pendant le RLHF par PPO ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Un seul, le LLM</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Trois : la politique, le modèle de référence et le reward model</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Deux : la politique et le RM</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div id="score-banner" class="score-banner"></div>
+  </div>
+
+  <!-- ── SOURCES PRIMAIRES ───────────────────────────────────────────── -->
+  <h2>Sources primaires</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/1706.03741" target="_blank">Christiano et al. — « Deep RL from Human Preferences »</a> (fondations du reward model)</li>
+    <li><a href="https://arxiv.org/abs/2009.01325" target="_blank">Stiennon et al. — « Learning to Summarize from Human Feedback »</a></li>
+    <li><a href="https://arxiv.org/abs/2203.02155" target="_blank">Ouyang et al. — « Training Language Models to Follow Instructions with Human Feedback »</a> (InstructGPT)</li>
+    <li><a href="https://arxiv.org/abs/1707.06347" target="_blank">Schulman et al. — « Proximal Policy Optimization Algorithms »</a></li>
+    <li><a href="https://arxiv.org/abs/2203.02155" target="_blank">Bai et al. — « Training a Helpful and Harmless Assistant with RLHF »</a> (Anthropic)</li>
+  </ul>
+
+  <!-- ── ET ENSUITE ──────────────────────────────────────────────────── -->
+  <h2>Et ensuite</h2>
+  <p style="color:var(--muted); font-size:0.9rem;">
+    Dites « suivant » pour suivre le plan, ou choisissez une session :
+  </p>
+  <ul>
+    <li><strong>S10 — DPO :</strong> comment il remplace PPO, et pourquoi (Tier 2)</li>
+    <li><a href="0008-cot-prompting-fr.html">S08 — Chain-of-thought et prompting :</a> le comportement que l'alignement façonne</li>
+    <li><a href="0003-llm-primitives-map.html">← Retour à la Carte des primitives</a></li>
+    <li><a href="0002-interview-framework.html">← Leçon 2 — Le cadre C.A.T.</a></li>
+  </ul>
+
+  <div class="ask-teacher">
+    <strong>Posez n'importe quelle question à votre professeur.</strong> Vous voulez dérouler la perte
+    Bradley-Terry sur un exemple, comparer RLHF et DPO, ou répéter une réponse C.A.T. à voix haute et
+    obtenir un retour ? Dites-le simplement.
+  </div>
+
+</main>
+
+<script>
+  let answered = {};
+  const TOTAL = 7;
+  const feedbacks = {
+    correct: "Correct.",
+    wrong: "Pas tout à fait — relisez la section ci-dessus et réessayez."
+  };
+
+  function answer(btn, result) {
+    const qDiv = btn.closest('.quiz-q');
+    const qId = qDiv.id;
+    if (answered[qId]) return;
+    answered[qId] = result;
+
+    qDiv.querySelectorAll('.quiz-option').forEach(b => b.disabled = true);
+    btn.classList.add(result);
+    qDiv.querySelector('.quiz-feedback').textContent = feedbacks[result];
+
+    if (Object.keys(answered).length === TOTAL) {
+      const correct = Object.values(answered).filter(v => v === 'correct').length;
+      const banner = document.getElementById('score-banner');
+      banner.textContent = correct >= 6
+        ? `${correct}/${TOTAL} — solide. Vous pouvez dérouler le pipeline d'alignement sous pression.`
+        : `${correct}/${TOTAL} — revoyez les erreurs, puis expliquez SFT → RM → PPO et le rôle de la contrainte KL à voix haute.`;
+      banner.classList.add('show', correct >= 6 ? 'pass' : 'fail');
+    }
+  }
+</script>
+</body>
+</html>

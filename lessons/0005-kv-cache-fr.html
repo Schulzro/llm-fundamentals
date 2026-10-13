@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Leçon 5 — KV cache : structure, mémoire et PagedAttention</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <style>
+    .diagram {
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.25rem;
+      margin: 0 0 1.5rem;
+      overflow-x: auto;
+    }
+    .group-label {
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: #fff;
+      background: #1e3a5f;
+      display: inline-block;
+      padding: 0.2rem 0.6rem;
+      border-radius: 4px;
+      margin-bottom: 0.6rem;
+    }
+    .cat { border-left: 4px solid var(--ok); }
+    .cat h3 { margin-top: 0.3rem; }
+    .mono { font-family: var(--mono); font-size: 0.88rem; }
+  </style>
+</head>
+<body>
+<main>
+
+  <div class="lesson-meta">Leçon 05 · Fondamentaux des LLM · Tier 1 — Internes du modèle</div>
+  <h1>Le KV cache en profondeur : structure, calcul de mémoire, GQA et PagedAttention</h1>
+  <p style="color:var(--muted); font-size:0.9rem; margin-bottom:2rem;">~22 min · Objectif entretien : dériver pourquoi le cache existe, calculer sa taille à la main, et expliquer GQA/MQA et PagedAttention comme réponses à une même contrainte mémoire</p>
+
+  <!-- ── POURQUOI CE SUJET ──────────────────────────────────────────── -->
+  <div class="callout">
+    <p>
+      <strong>Le KV cache est le pont entre la théorie (attention, O(n²)) et la réalité (mémoire, coût,
+      latence).</strong> Ignorez-le et vous ne pouvez pas expliquer pourquoi le contexte long est cher,
+      pourquoi le time-to-first-token diffère de la vitesse par token, ni pourquoi GQA et vLLM existent.
+      C'est aussi la question d'entretien la plus fine du Tier 1 : elle sépare celui qui a lu « les LLM
+      mettent K et V en cache » de celui qui sait <em>le calculer</em> et <em>le réduire</em>.
+    </p>
+  </div>
+
+  <p>
+    Cette leçon approfondit la session S05 de la Carte. On part du <strong>coût autorégressif</strong> qui
+    motive le cache, on examine <strong>ce qui y vit réellement</strong>, on fait le <strong>calcul de
+    mémoire à la main</strong>, puis on traite les trois grandes réponses à cette contrainte :
+    <strong>GQA/MQA</strong>, <strong>PagedAttention</strong> et les <strong>leviers de réduction</strong>
+    (quantization, fenêtre glissante, attention sinks, prefix caching).
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 1. POURQUOI LE CACHE EXISTE -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>1 · Pourquoi le cache existe</h2>
+  <span class="group-label">Autorégressif · O(n²) · K et V invariants</span>
+
+  <div class="callout">
+    <p>
+      <strong>Les vecteurs Key et Value d'un token ne changent jamais une fois calculés, donc on les
+      stocke : chaque nouveau token ne calcule que ses propres K et V et fait porter son unique query
+      sur tout le cache.</strong>
+    </p>
+  </div>
+
+  <p>
+    La génération est autorégressive : le modèle émet un token, l'ajoute à la séquence, puis recommence.
+    Sans cache, calculer le token <em>n</em> exigerait de recalculer K et V pour les <em>n − 1</em> tokens
+    précédents — à chaque étape. Le travail par étape serait en O(n²), le travail total en O(n³).
+  </p>
+  <p>
+    L'observation clé : <strong>K et V des tokens passés sont constants.</strong> Seul le nouveau Q
+    change. On met donc K et V en cache ; à chaque étape de decode, on calcule Q/K/V pour le
+    <em>seul</em> nouveau token, on ajoute ses K et V au cache, et on fait porter son query unique sur
+    toutes les keys en cache. Le coût par étape passe de O(n²) à <strong>O(n)</strong> — mais on paie
+    cette optimisation en <em>mémoire</em>, et c'est là que tout se joue.
+  </p>
+  <div class="diagram">
+    <pre><code>SANS cache :  token n  →  recalcule K,V de tous les tokens 0..n     O(n²) par étape
+AVEC cache :  token n  →  calcule Q,K,V du seul token n seulement
+                          K_n, V_n s'ajoutent au cache
+                          Q_n  ·  [K_0 ... K_n]              O(n) par étape</code></pre>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 2. CE QUI VIT DANS LE CACHE -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>2 · Ce qui vit réellement dans le cache</h2>
+  <span class="group-label">Par couche · Par tête · K et V · Pas de Q</span>
+
+  <div class="callout">
+    <p>
+      <strong>Le cache contient, pour chaque couche et chaque tête, les tenseurs K et V de chaque token
+      déjà traité — jamais les queries, qui ne servent qu'une fois.</strong>
+    </p>
+  </div>
+
+  <p>
+    Ce n'est <em>pas</em> un cache de tokens, ni d'activations intermédiaires. C'est précisément les
+    projecteurs K et V de la self-attention, conservés couche par couche. Schématiquement, pour une
+    couche donnée :
+  </p>
+  <ul>
+    <li><strong>K cache</strong> : matrice de forme <span class="mono">[longueur, têtes_KV, head_dim]</span></li>
+    <li><strong>V cache</strong> : même forme que K</li>
+    <li><strong>Q</strong> : <em>absente</em> — une query n'est utilisée que pour un seul pas de temps, la garder serait du gaspillage pur.</li>
+  </ul>
+  <p>
+    Deux conséquences immédiates, souvent pièges en entretien : le cache est <strong>par couche</strong>
+    (donc multiplié par le nombre de couches) et il est <strong>par tête</strong> (donc multiplié par le
+    nombre de têtes K/V) — d'où tout l'intérêt de GQA, qui attaque le second facteur.
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 3. LE CALCUL DE MÉMOIRE -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>3 · Le calcul de mémoire, à la main</h2>
+  <span class="group-label">Formule · LLaMA-2 7B · Batch · FP16</span>
+
+  <div class="callout">
+    <p>
+      <strong>Taille du KV cache ≈ 2 × couches × têtes_KV × head_dim × longueur_séquence × batch ×
+      octets_par_élément.</strong>
+    </p>
+  </div>
+
+  <p>
+    Le facteur <strong>2</strong> représente K <em>et</em> V. La longueur et le batch sont les deux
+    dimensions qui explosent en production : la longueur par requête, et le nombre de requêtes servies
+    en parallèle. Voyons un cas concret.
+  </p>
+
+  <div class="diagram">
+    <pre><code>LLaMA-2 7B — 32 couches, 32 têtes K/V, head_dim 128, fp16 (2 octets), 1 séquence de 4096 tokens
+
+  2 × 32 couches × 32 têtes × 128 × 4096 × 1 × 2 octets  =  2 147 483 648  ≈  2 Go
+
+  Par token : 512 Ko
+  Batch de 32 : 32 × 2 Go = 64 Go   ← au-delà d'un A100 40 Go ; à égalité avec les poids sur du 80 Go</code></pre>
+  </div>
+
+  <p>
+    Retenez le résultat : <strong>sur un 7B en fp16, une seule conversation de 4K tokens coûte déjà
+    ~2 Go de KV cache — comparable à une fraction significative des poids du modèle, et multiplié par
+    le batch en production.</strong> C'est ce chiffre que l'examinateur veut vous entendre dériver.
+  </p>
+
+  <div class="callout warn">
+    <p>
+      <strong>Le piège de la question :</strong> « quel est le facteur dominant ? » Pour une requête
+      courte, ce sont les poids. Pour de longs contextes à fort batch, c'est le KV cache. Dire
+      explicitement que <em>le cache peut éclipser les poids</em> est le signal de profondeur attendu.
+    </p>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 4. GQA ET MQA -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>4 · GQA et MQA : réduire le cache en partageant les têtes</h2>
+  <span class="group-label">Multi-Head · Multi-Query · Grouped-Query</span>
+
+  <div class="callout">
+    <p>
+      <strong>GQA et MQA réduisent la taille du cache en faisant partager les têtes K/V entre plusieurs
+      têtes de query — MQA par toutes, GQA par groupes.</strong>
+    </p>
+  </div>
+
+  <table>
+    <thead>
+      <tr><th>Variante</th><th>Têtes K/V</th><th>Taille du cache</th><th>Qualité</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>MHA</strong> (Multi-Head, classique)</td>
+        <td>= nombre de têtes de query</td>
+        <td>Référence (1×)</td>
+        <td>Référence</td>
+      </tr>
+      <tr>
+        <td><strong>MQA</strong> (Multi-Query)</td>
+        <td>1 seule, partagée par toutes</td>
+        <td>÷ n_heads (ex. ÷32)</td>
+        <td>Légère dégradation</td>
+      </tr>
+      <tr>
+        <td><strong>GQA</strong> (Grouped-Query)</td>
+        <td>Groupes : 1 tête K/V pour g q têtes</td>
+        <td>÷ g (ex. ÷8)</td>
+        <td>Proche de MHA</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    L'idée est purement structurelle : au lieu d'avoir une paire K/V par tête de query, on en partage
+    une entre plusieurs queries. En <strong>MQA</strong> (Shazeer, 2019), toutes les queries regardent la
+    même K/V — le cache est divisé par le nombre de têtes, au prix d'une perte de qualité.
+    En <strong>GQA</strong> (Ainslie et al., 2023), on groupe : par exemple 8 têtes K/V pour 64 têtes de
+    query. On récupère l'essentiel du gain mémoire avec une qualité quasi identique à MHA. C'est
+    aujourd'hui le réglage par défaut des grands modèles (LLaMA-2 70B, Mistral, etc.).
+  </p>
+  <div class="diagram">
+    <pre><code>LLaMA-2 70B — 80 couches, 64 têtes de query, 8 têtes K/V (GQA), head_dim 128, fp16
+
+  GQA (8 têtes K/V) : 2 × 80 × 8  × 128 × 4096 × 2  ≈  1,25 Go
+  Si c'était MHA (64)  : 2 × 80 × 64 × 128 × 4096 × 2  ≈  10   Go
+
+  → GQA divise le cache par 8 avec une qualité quasi inchangée</code></pre>
+  </div>
+  <div class="callout warn">
+    <p>
+      <strong>Nuance à connaître :</strong> on ne réentraîne pas forcément de zéro. On peut convertir un
+      modèle MHA en GQA en <em>moyennant</em> les têtes K/V d'un groupe puis en faisant du fine-tuning de
+      récupération (« uptraining ») — un compromis coût/qualité classique.
+    </p>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 5. PAGEDATTENTION -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>5 · PagedAttention : le cache comme mémoire paginée</h2>
+  <span class="group-label">vLLM · Fragmentation · Pages · Copy-on-write</span>
+
+  <div class="callout">
+    <p>
+      <strong>PagedAttention stocke le KV cache en blocs de taille fixe, non nécessairement contigus,
+      reliés par une table de blocs — comme la mémoire virtuelle paginée d'un OS — ce qui supprime la
+      fragmentation.</strong>
+    </p>
+  </div>
+
+  <p>
+    Le problème qu'elle résout est un problème d'<em>allocation</em>, pas de calcul. Une implémentation
+    naïve réserve, pour chaque requête, un buffer contigu de la longueur <em>maximale</em> possible. Or
+    on ne connaît la longueur réelle d'une génération qu'à la fin : on réserve donc beaucoup plus que
+    nécessaire (fragmentation interne), et les trous entre blocs gaspillent la mémoire (fragmentation
+    externe). En pratique, cette approche laisse souvent 60 à 80 % de la mémoire KV inutilisée.
+  </p>
+  <p>
+    PagedAttention (vLLM, Kwon et al., 2023) découpe le cache en <strong>pages</strong> de taille fixe
+    (par ex. 16 tokens), allouées à la demande et rangées n'importe où en mémoire. Une <strong>table de
+    blocs</strong> fait la correspondance entre position logique dans la séquence et page physique. Deux
+    bénéfices majeurs :
+  </p>
+  <ul>
+    <li><strong>Gaspillage quasi nul</strong> (les mesures rapportent &lt;4 %), donc des batchs plus grands → meilleur débit.</li>
+    <li><strong>Partage de pages</strong> : un préfixe commun peut être partagé entre requêtes, et un échantillonnage parallèle (n&gt;1) ou un beam search utilise le <em>copy-on-write</em> — les branches partagent les pages du prompt.</li>
+  </ul>
+  <p>
+    C'est exactement l'analogie du système d'exploitation : la pagination transforme une contrainte de
+    mémoire en un problème de gestion de table de pages.
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 6. PREFILL VS DECODE / ROOFLINE -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>6 · Prefill vs decode : compute-bound contre bandwidth-bound</h2>
+  <span class="group-label">TTFT · Latence inter-token · Roofline</span>
+
+  <div class="callout">
+    <p>
+      <strong>Le prefill traite tout le prompt en parallèle et est limité par le calcul ; le decode
+      produit un token à la fois, doit relire tout le cache à chaque pas, et est limité par la bande
+      passante mémoire.</strong>
+    </p>
+  </div>
+
+  <table>
+    <thead>
+      <tr><th>Phase</th><th>Travail</th><th>Goulot</th><th>Métrique</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Prefill</strong></td>
+        <td>Tous les tokens du prompt en une passe parallèle ; remplit le cache</td>
+        <td>Calcul (grandes multiplications matricielles → lié au FLOPs)</td>
+        <td><strong>TTFT</strong></td>
+      </tr>
+      <tr>
+        <td><strong>Decode</strong></td>
+        <td>Un token à la fois ; lit tout le cache à chaque pas</td>
+        <td>Bande passante mémoire (peu de FLOPs, beaucoup d'octets déplacés)</td>
+        <td><strong>Latence inter-token</strong></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    L'intensité arithmétique (FLOPs par octet déplacé) explique tout. En decode, on multiplie une
+    matrice de poids par un <em>vecteur</em> — presque chaque octet chargé ne sert qu'une poignée
+    d'opérations. On est donc <strong>memory-bandwidth-bound</strong> : la vitesse par token dépend
+    surtout des octets qu'on doit déplacer depuis la mémoire (cache + poids), pas de la puissance de
+    calcul. C'est ce qui rend la quantization des poids <em>et du cache</em> si efficace en decode, et
+    c'est ce qui explique pourquoi regrouper les requêtes (continuous batching) augmente le débit sans
+    changer le modèle.
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 7. LES LEVIERS -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>7 · Les cinq leviers pour réduire le cache</h2>
+  <span class="group-label">Quantization · Fenêtre · Sinks · Prefix · GQA</span>
+
+  <table>
+    <thead>
+      <tr><th>Levier</th><th>Effet</th><th>Coût / compromis</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>GQA / MQA</strong></td>
+        <td>Partage des têtes K/V → cache ÷4 à ÷32</td>
+        <td>Change l'architecture (uptraining) ; légère perte de qualité</td>
+      </tr>
+      <tr>
+        <td><strong>PagedAttention</strong></td>
+        <td>Élimine la fragmentation → plus de batch dans la même mémoire</td>
+        <td>Complexité d'implémentation (table de pages, copy-on-write)</td>
+      </tr>
+      <tr>
+        <td><strong>Quantization du cache</strong></td>
+        <td>fp16 → fp8/int8 : cache ÷2 à ÷4</td>
+        <td>Petite perte de fidélité ; sur-outillage sur contextes très longs</td>
+      </tr>
+      <tr>
+        <td><strong>Fenêtre glissante</strong> (Mistral)</td>
+        <td>Cache borné par la fenêtre, indépendant de la longueur totale</td>
+        <td>Le modèle ne « voit » plus au-delà de la fenêtre par couche</td>
+      </tr>
+      <tr>
+        <td><strong>Attention sinks</strong> (StreamingLLM)</td>
+        <td>Garde les premiers tokens + une fenêtre récente → flux infinis à cache constant</td>
+        <td>Approximation ; perte d'information lointaine</td>
+      </tr>
+      <tr>
+        <td><strong>Prefix caching</strong></td>
+        <td>Réutilise le KV d'un préfixe partagé entre requêtes → TTFT quasi nul</td>
+        <td>Nécessite des préfixes identiques (habillage, prompts système)</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="callout ok">
+    <p>
+      <strong>Le fil :</strong> GQA et la quantization attaquent les <em>octets par élément</em>,
+      PagedAttention et le prefix caching attaquent le <em>gaspillage d'allocation</em>, la fenêtre
+      glissante et les attention sinks attaquent la <em>longueur</em>. En entretien, classer les leviers
+      selon <em>quelle dimension de la formule</em> ils réduisent est la réponse qui marque.
+    </p>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 8. PIÈGES -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>8 · Les pièges d'entretien</h2>
+
+  <table>
+    <thead>
+      <tr><th>Piège</th><th>La bonne réponse</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>« On met les queries en cache aussi »</td>
+        <td>Non — Q disparaît après usage ; seuls K et V sont réutilisés.</td>
+      </tr>
+      <tr>
+        <td>« Le cache coûte la même chose pour tout le monde »</td>
+        <td>Non : il croît avec la longueur, le batch, les couches, les têtes et la précision.</td>
+      </tr>
+      <tr>
+        <td>« PagedAttention accélère le calcul de l'attention »</td>
+        <td>Non : elle résout un problème d'<em>allocation mémoire</em>, pas de FLOPs.</td>
+      </tr>
+      <tr>
+        <td>« GQA est gratuit »</td>
+        <td>Non : c'est un compromis qualité/mémoire ; souvent obtenu par uptraining.</td>
+      </tr>
+      <tr>
+        <td>« Decode est limité par le calcul »</td>
+        <td>Non : il est limité par la bande passante mémoire — c'est pourquoi la quantization aide tant.</td>
+      </tr>
+      <tr>
+        <td>« Long contexte = juste plus de calcul »</td>
+        <td>Non : c'est d'abord une limite <em>mémoire</em> (KV cache × batch).</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- C.A.T. -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <div class="callout cat">
+    <h3>C.A.T. — « Qu'est-ce que le KV cache et pourquoi est-ce important ? »</h3>
+    <p><strong>Classify :</strong> « C'est l'optimisation d'inférence qui rend le decoding autorégressif faisable, et c'est le principal poste mémoire. »</p>
+    <p><strong>Apply :</strong> « Les Keys et Values des tokens passés ne changent pas, donc on les stocke par couche et par tête ; chaque nouveau token ne calcule que son propre Q/K/V et fait porter son attention sur tout le cache, ramenant le coût par étape de O(n²) à O(n). Sa taille ≈ 2 × couches × têtes_KV × head_dim × longueur × batch × octets — sur un 7B en fp16 à 4K tokens, environ 2 Go par séquence. »</p>
+    <p><strong>Trap :</strong> « Le hic est la mémoire : à fort batch, le cache peut éclipser les poids. D'où GQA/MQA pour réduire les têtes K/V, la quantization du cache, PagedAttention pour la fragmentation, et les fenêtres glissantes pour borner la longueur. »</p>
+  </div>
+
+  <div class="callout cat">
+    <h3>C.A.T. — « Comment réduiriez-vous l'empreinte mémoire du KV cache en production ? »</h3>
+    <p><strong>Classify :</strong> « C'est un problème d'optimisation mémoire à l'inférence, décomposable selon la formule de taille. »</p>
+    <p><strong>Apply :</strong> « J'attaque chaque facteur : GQA/MQA réduit le nombre de têtes K/V ; la quantization fp8 réduit les octets par élément ; PagedAttention supprime la fragmentation et permet des batchs plus grands ; une fenêtre glissante ou des attention sinks bornent la longueur effective ; et le prefix caching réutilise le KV d'un préfixe partagé pour éliminer le TTFT redondant. »</p>
+    <p><strong>Trap :</strong> « Ce ne sont pas des gains gratuits : GQA demande un uptraining, la quantization a un coût de fidélité, les fenêtres perdent l'information lointaine. On choisit selon si l'on est limité par la mémoire, la latence ou la qualité. »</p>
+  </div>
+
+  <!-- ── QUIZ ───────────────────────────────────────────────────────── -->
+  <div class="quiz">
+    <h2>Contrôle de restitution</h2>
+    <p style="color:var(--muted); font-size:0.9rem; margin-bottom:1rem;">Ne cherchez pas. Répondez de mémoire, à voix haute si possible.</p>
+
+    <div class="quiz-q" id="q1">
+      <p>1. Que contient exactement le KV cache ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Les activations de toutes les couches pour chaque token</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Les tenseurs Key et Value de chaque couche et chaque tête, pour les tokens déjà traités</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Les queries, keys et values de tous les tokens passés</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q2">
+      <p>2. Pourquoi ne cache-t-on pas les queries ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Parce qu'elles sont trop volumineuses en mémoire</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Parce qu'une query ne sert qu'une fois et n'est jamais réutilisée</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Parce qu'elles sont recalculées à chaque étape de toute façon</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q3">
+      <p>3. Dans la formule de taille, le facteur 2 représente…</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…les phases prefill et decode</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">…les deux tenseurs K et V</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…les octets par élément en fp16</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q4">
+      <p>4. Que fait GQA par rapport à MHA ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Il supprime les têtes de query pour accélérer le decode</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Il partage une tête K/V entre plusieurs têtes de query, réduisant le cache</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Il augmente le nombre de têtes K/V pour améliorer la qualité</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q5">
+      <p>5. Quel problème PagedAttention résout-elle réellement ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Le coût quadratique du calcul de l'attention</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">La qualité de la quantization du cache</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">La fragmentation mémoire due aux allocations contiguës non utilisées</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q6">
+      <p>6. La phase de decode est limitée par…</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…le calcul (FLOPs), comme le prefill</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">…la bande passante mémoire, car elle relit tout le cache à chaque token</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…le nombre de couches uniquement</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q7">
+      <p>7. Qu'est-ce qui borne la mémoire du KV cache dans un modèle à fenêtre glissante ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">La taille du vocabulaire</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">La taille de la fenêtre, indépendamment de la longueur totale de la séquence</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Le nombre de requêtes concurrentes</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div id="score-banner" class="score-banner"></div>
+  </div>
+
+  <!-- ── SOURCES PRIMAIRES ───────────────────────────────────────────── -->
+  <h2>Sources primaires</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/1911.02150" target="_blank">Shazeer — « Fast Transformer Decoding: One Write-Head is All You Need »</a> (MQA)</li>
+    <li><a href="https://arxiv.org/abs/2305.13245" target="_blank">Ainslie et al. — « GQA: Training Generalized Multi-Query Transformer Models »</a></li>
+    <li><a href="https://arxiv.org/abs/2309.06180" target="_blank">Kwon et al. — « Efficient Memory Management for Large Language Model Serving with PagedAttention »</a> (vLLM)</li>
+    <li><a href="https://arxiv.org/abs/2309.17453" target="_blank">Xiao et al. — « Efficient Streaming Language Models with Attention Sinks »</a> (StreamingLLM)</li>
+    <li><a href="https://arxiv.org/abs/2205.14135" target="_blank">Dao et al. — « FlashAttention »</a> (attention exacte sans matérialiser la matrice complète)</li>
+    <li><a href="https://arxiv.org/abs/2211.05102" target="_blank">Pope et al. — « Efficiently Scaling Transformer Inference »</a> (analyse mémoire et roofline de l'inférence)</li>
+  </ul>
+
+  <!-- ── ET ENSUITE ──────────────────────────────────────────────────── -->
+  <h2>Et ensuite</h2>
+  <p style="color:var(--muted); font-size:0.9rem;">
+    Dites « suivant » pour suivre le plan, ou choisissez une session :
+  </p>
+  <ul>
+    <li><a href="0006-tokenization-bpe-quirks-fr.html">S06 — Tokenisation en profondeur : BPE, bizarreries, coût et fenêtre de contexte →</a></li>
+    <li><strong>S15 — Serving :</strong> TTFT, continuous batching, quantization (Tier 4) — la suite naturelle du prefill/decode</li>
+    <li><strong>S18 — Scaling laws en profondeur :</strong> les maths de Chinchilla (Tier 1)</li>
+    <li><a href="0004-tier1-how-llms-think-fr.html">← Leçon 4 — Vue d'ensemble du Tier 1</a></li>
+    <li><a href="0003-llm-primitives-map.html">← Retour à la Carte des primitives</a></li>
+    <li><a href="0002-interview-framework.html">← Leçon 2 — Le cadre C.A.T.</a></li>
+  </ul>
+
+  <div class="ask-teacher">
+    <strong>Posez n'importe quelle question à votre professeur.</strong> Vous voulez calculer le cache
+    d'un autre modèle, décortiquer PagedAttention, ou répéter une réponse C.A.T. à voix haute et obtenir
+    un retour ? Dites-le simplement.
+  </div>
+
+</main>
+
+<script>
+  let answered = {};
+  const TOTAL = 7;
+  const feedbacks = {
+    correct: "Correct.",
+    wrong: "Pas tout à fait — relisez la section ci-dessus et réessayez."
+  };
+
+  function answer(btn, result) {
+    const qDiv = btn.closest('.quiz-q');
+    const qId = qDiv.id;
+    if (answered[qId]) return;
+    answered[qId] = result;
+
+    qDiv.querySelectorAll('.quiz-option').forEach(b => b.disabled = true);
+    btn.classList.add(result);
+    qDiv.querySelector('.quiz-feedback').textContent = feedbacks[result];
+
+    if (Object.keys(answered).length === TOTAL) {
+      const correct = Object.values(answered).filter(v => v === 'correct').length;
+      const banner = document.getElementById('score-banner');
+      banner.textContent = correct >= 6
+        ? `${correct}/${TOTAL} — solide. Vous savez calculer et réduire le cache.`
+        : `${correct}/${TOTAL} — revoyez les erreurs, puis dérivez la formule de taille à voix haute, avec un exemple.`;
+      banner.classList.add('show', correct >= 6 ? 'pass' : 'fail');
+    }
+  }
+</script>
+</body>
+</html>

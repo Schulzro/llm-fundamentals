@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 1 — Prompt Caching: The One Invariant</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<main>
+
+  <div class="lesson-meta">Lesson 01 · LLM Fundamentals · Prompt Caching</div>
+  <h1>Prompt Caching: The One Invariant</h1>
+  <p style="color:var(--muted); font-size:0.9rem; margin-bottom:2rem;">~12 min · Interview target: explain prompt caching in 2 min, cold</p>
+
+  <!-- ── THE CORE CONCEPT ────────────────────────────────────────────── -->
+  <h2>The one thing to hold in memory</h2>
+
+  <div class="callout">
+    <p><strong>Prompt caching is a prefix match.</strong> Any change anywhere in the prefix invalidates everything after it.</p>
+  </div>
+
+  <p>
+    Everything else about prompt caching — where to put markers, what breaks it, when to use it —
+    follows directly from this single fact. Nail it and the rest is bookkeeping.
+  </p>
+
+  <!-- ── WHAT IS A PREFIX ────────────────────────────────────────────── -->
+  <h2>What "prefix" actually means</h2>
+
+  <p>When you call the Claude API, your request has three sections, always rendered in this order:</p>
+
+  <pre><code>tools  →  system  →  messages</code></pre>
+
+  <p>
+    The API hashes the <em>exact bytes</em> up to each <code>cache_control</code> breakpoint you mark.
+    On the next request, it checks: does the prefix match byte-for-byte up to that breakpoint?
+    If yes → cache hit. If anything changed, even one character → miss, and you pay full price.
+  </p>
+
+  <p>
+    This means a timestamp embedded in your system prompt, a reordered JSON key in a tool definition,
+    or a different user ID injected at the top — any of these silently kills caching for
+    <em>everything downstream</em> of that change.
+  </p>
+
+  <!-- ── HOW YOU MARK A BREAKPOINT ──────────────────────────────────── -->
+  <h2>How to mark a cache breakpoint</h2>
+
+  <p>Add <code>cache_control</code> to any content block — system text, tool definitions, message content:</p>
+
+  <pre><code class="language-json">{
+  "type": "text",
+  "text": "You are a helpful assistant. [... 2,000 tokens of instructions ...]",
+  "cache_control": {"type": "ephemeral"}
+}</code></pre>
+
+  <p>
+    The marker says: <em>"cache everything up to and including this block."</em>
+    You get up to <strong>4 breakpoints</strong> per request.
+    The most common pattern is one breakpoint at the end of your system prompt.
+  </p>
+
+  <!-- ── TTL & PRICING ───────────────────────────────────────────────── -->
+  <h2>TTL and cost — the numbers that come up in interviews</h2>
+
+  <table>
+    <thead>
+      <tr><th>TTL option</th><th>Write cost</th><th>Read cost</th><th>Break-even reads</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>ephemeral</code> (5 min, default)</td><td>1.25× base</td><td>0.1× base</td><td>2 requests</td></tr>
+      <tr><td><code>ephemeral, ttl: "1h"</code></td><td>2× base</td><td>0.1× base</td><td>3 requests</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <p>
+      <strong>The write is expensive.</strong> A cold write costs more than the uncached base price.
+      You only win if subsequent reads are frequent enough to pay it back.
+      5-min TTL breaks even at 2 requests; 1-hour TTL needs 3.
+    </p>
+  </div>
+
+  <!-- ── MINIMUM CACHEABLE SIZE ──────────────────────────────────────── -->
+  <h2>Minimum cacheable size — the gotcha interviewers love</h2>
+
+  <p>
+    Caching silently does nothing if your prefix is too short.
+    No error — you just see <code>cache_creation_input_tokens: 0</code> in the response.
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Model family</th><th>Minimum tokens</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Claude Opus 5, Fable 5 (newest)</td><td>512</td></tr>
+      <tr><td>Opus 4.8, Sonnet 5, Sonnet 4.6</td><td>1,024</td></tr>
+      <tr><td>Opus 4.7, Haiku 3.5</td><td>2,048</td></tr>
+      <tr><td>Opus 4.6, Haiku 4.5</td><td>4,096</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <p>
+      <strong>The minimum is not monotonic.</strong> Newer ≠ lower threshold in all cases.
+      A 3K-token prompt caches on Opus 4.8 (1K min) but silently fails on Haiku 4.5 (4K min).
+      This is a common interview trap — don't say "newer models are always more cache-friendly."
+    </p>
+  </div>
+
+  <!-- ── HOW TO VERIFY ───────────────────────────────────────────────── -->
+  <h2>How to verify it's working</h2>
+
+  <p>Check the <code>usage</code> object in the response:</p>
+
+  <pre><code class="language-json">"usage": {
+  "input_tokens": 42,                  // uncached remainder only
+  "cache_creation_input_tokens": 2800, // paid 1.25× to write cache
+  "cache_read_input_tokens": 0         // on first request — expected
+}</code></pre>
+
+  <p>On the second request with an identical prefix:</p>
+
+  <pre><code class="language-json">"usage": {
+  "input_tokens": 42,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 2800     // paid 0.1× — cache hit!
+}</code></pre>
+
+  <div class="callout ok">
+    <p>
+      <strong>Diagnostic rule:</strong> if <code>cache_read_input_tokens</code> stays zero across
+      repeated identical requests, a <em>silent invalidator</em> is at work —
+      diff the rendered prompt bytes between two requests to find it.
+    </p>
+  </div>
+
+  <div class="callout warn">
+    <p>
+      <strong><code>input_tokens</code> is the uncached remainder only.</strong>
+      Total prompt size = <code>input_tokens + cache_creation_input_tokens + cache_read_input_tokens</code>.
+      Interviewers sometimes ask "how big was your prompt?" — don't read just <code>input_tokens</code>.
+    </p>
+  </div>
+
+  <!-- ── THE 2-MINUTE ANSWER ─────────────────────────────────────────── -->
+  <h2>Your 2-minute interview answer</h2>
+
+  <div class="callout">
+    <p>
+      "Prompt caching lets you pay once to store the expensive part of your prompt — usually the system
+      instructions or a large context block — and then serve subsequent requests at about one-tenth the cost.
+      It works as a prefix match: you mark a breakpoint in your prompt, the API hashes everything up to
+      that point, and if the next request matches byte-for-byte it returns a cache hit.
+      The catch is that any change before the breakpoint — a timestamp, a reordered key, a user-specific injection —
+      invalidates everything downstream. You also need your prefix to exceed a model-dependent minimum
+      (usually 1K tokens) or caching silently does nothing.
+      You verify it's working by checking <code>cache_read_input_tokens</code> in the response usage object."
+    </p>
+  </div>
+
+  <!-- ── QUIZ ───────────────────────────────────────────────────────── -->
+  <div class="quiz">
+    <h2>Retrieval check</h2>
+    <p style="color:var(--muted); font-size:0.9rem; margin-bottom:1rem;">Don't look up. Answer from memory. Answers are equal length by design.</p>
+
+    <div class="quiz-q" id="q1">
+      <p>1. The cache key is derived from…</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…the hash of the entire request body</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">…the exact bytes of the prompt up to each breakpoint</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…the model ID and the session token combined</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q2">
+      <p>2. The default TTL for <code>cache_control: {type: "ephemeral"}</code> is…</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…1 hour from the first write</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…24 hours from the last access</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">…5 minutes from the last write</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q3">
+      <p>3. With the 5-minute TTL, cache breaks even at…</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…1 additional request after the write</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">…2 requests total (the write + one read)</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…5 requests total (one per minute of TTL)</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q4">
+      <p>4. You run two requests with identical prompts but see <code>cache_read_input_tokens: 0</code> both times. Most likely cause:</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…the model does not support caching yet</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…caching is disabled by default on the API</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">…a silent invalidator is changing the prefix between requests</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q5">
+      <p>5. Which model has the <em>highest</em> minimum cacheable token count?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…Claude Opus 5 (newest flagship)</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">…Claude Haiku 4.5 (4,096 tokens)</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…Claude Sonnet 4.6 (mid-tier)</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div id="score-banner" class="score-banner"></div>
+  </div>
+
+  <!-- ── PRIMARY SOURCE ─────────────────────────────────────────────── -->
+  <h2>Primary source</h2>
+  <p>
+    <a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching" target="_blank">
+      Anthropic — Prompt caching (official docs)
+    </a> — the canonical reference. Read the "How prompt caching works" and "Cache limitations" sections.
+  </p>
+
+  <!-- ── WHAT'S NEXT ─────────────────────────────────────────────────── -->
+  <h2>What's next</h2>
+  <ul>
+    <li><a href="0002-silent-invalidators.html">Lesson 2 — Silent Invalidators: what silently kills your cache</a></li>
+    <li><a href="../reference/">Reference docs</a></li>
+  </ul>
+
+  <div class="ask-teacher">
+    <strong>Ask your teacher anything.</strong> Confused about break-even math? Want a harder quiz question?
+    Unsure how to phrase this in an interview? Just ask — the agent is here to help.
+  </div>
+
+</main>
+
+<script>
+  let answered = {};
+  const feedbacks = {
+    correct: "Correct.",
+    wrong: "Not quite — re-read the section above and try again."
+  };
+
+  function answer(btn, result) {
+    const qDiv = btn.closest('.quiz-q');
+    const qId = qDiv.id;
+    if (answered[qId]) return;
+    answered[qId] = result;
+
+    qDiv.querySelectorAll('.quiz-option').forEach(b => b.disabled = true);
+    btn.classList.add(result);
+    qDiv.querySelector('.quiz-feedback').textContent = feedbacks[result];
+
+    // Score after all 5 answered
+    if (Object.keys(answered).length === 5) {
+      const correct = Object.values(answered).filter(v => v === 'correct').length;
+      const banner = document.getElementById('score-banner');
+      banner.textContent = correct >= 4
+        ? `${correct}/5 — solid. You're ready to explain this cold.`
+        : `${correct}/5 — review the misses, then re-read the 2-minute answer above.`;
+      banner.classList.add('show', correct >= 4 ? 'pass' : 'fail');
+    }
+  }
+</script>
+</body>
+</html>

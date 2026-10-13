@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Leçon 4 — Tier 1 : Comment « pensent » les LLM</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <style>
+    .diagram {
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.25rem;
+      margin: 0 0 1.5rem;
+      overflow-x: auto;
+    }
+    .group-label {
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: #fff;
+      background: #1e3a5f;
+      display: inline-block;
+      padding: 0.2rem 0.6rem;
+      border-radius: 4px;
+      margin-bottom: 0.6rem;
+    }
+    .cat { border-left: 4px solid var(--ok); }
+    .cat h3 { margin-top: 0.3rem; }
+  </style>
+</head>
+<body>
+<main>
+
+  <div class="lesson-meta">Leçon 04 · Fondamentaux des LLM · Tier 1 — Internes du modèle</div>
+  <h1>Comment « pensent » les LLM : la vue d'ensemble du Tier 1</h1>
+  <p style="color:var(--muted); font-size:0.9rem; margin-bottom:2rem;">~20 min · Objectif entretien : expliquer l'attention, le KV cache, la tokenisation et les scaling laws à froid — et nommer le piège de chacun</p>
+
+  <!-- ── POURQUOI CE TIER ───────────────────────────────────────────── -->
+  <div class="callout">
+    <p>
+      <strong>Le Tier 1 est le filtre de profondeur.</strong> Les questions de Tier 3 et 4
+      (« comment construiriez-vous X ») peuvent se bluffer avec des mots-clés. Les questions de Tier 1 —
+      « déroulez-moi le mécanisme d'attention », « qu'est-ce qui vit réellement dans le KV cache » — non.
+      C'est là que l'examinateur décide si vous comprenez la machine ou seulement son API.
+    </p>
+  </div>
+
+  <p>
+    Cette leçon est la carte de quatre sujets : <strong>attention &amp; architecture</strong>,
+    <strong>le KV cache</strong>, <strong>la tokenisation</strong> et les <strong>scaling laws</strong>.
+    Chacun aura sa propre session d'approfondissement plus tard (S04, S05, S06, S18). Ici, vous obtenez
+    le mécanisme, la formulation prête pour l'entretien, et le seul piège par sujet qui distingue celui
+    qui a lu l'article de celui qui l'a compris.
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 1. ATTENTION -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>1 · Attention &amp; architecture</h2>
+  <span class="group-label">Attention · Q/K/V · Masquage causal · Multi-têtes</span>
+
+  <h3>Le mécanisme en une phrase</h3>
+  <div class="callout">
+    <p>
+      <strong>L'attention est une recherche pondérée et « douce ».</strong> Chaque token pose une
+      question (sa <em>Query</em>), la compare à l'étiquette de chaque autre token (sa <em>Key</em>),
+      et récupère un mélange pondéré de leur contenu (leurs <em>Values</em>) — où les poids mesurent à
+      quel point chaque query correspond à chaque key.
+    </p>
+  </div>
+
+  <p>
+    Concrètement, pour chaque token le modèle produit trois vecteurs en multipliant son embedding par
+    trois matrices de poids apprises : une <strong>Query (Q)</strong>, une <strong>Key (K)</strong> et
+    une <strong>Value (V)</strong>. Le score d'attention entre le token <em>i</em> et le token <em>j</em>
+    est le produit scalaire de la query de <em>i</em> avec la key de <em>j</em>. Ces scores sont mis à
+    l'échelle, passés dans un softmax pour devenir des poids dont la somme vaut 1, puis utilisés pour
+    calculer une moyenne pondérée de tous les vecteurs Value. Cette moyenne devient la nouvelle
+    représentation du token — un mélange d'informations issu de chaque token auquel il a prêté attention.
+  </p>
+
+  <div class="diagram">
+    <pre><code>Attention(Q, K, V) = softmax( Q·Kᵀ / √d_k ) · V
+
+     Q·Kᵀ        →  scores bruts « quelle est la pertinence de chaque token pour moi ? »
+     / √d_k      →  mise à l'échelle pour que les gradients du softmax ne s'évanouissent pas
+     softmax     →  transforme les scores en poids de somme 1
+     · V         →  mélange pondéré du contenu de chaque token</code></pre>
+  </div>
+
+  <p>
+    Pourquoi <code>/ √d_k</code> ? Les produits scalaires grandissent avec la dimension <code>d_k</code>.
+    Sans mise à l'échelle, de grandes valeurs poussent le softmax vers un régime quasi one-hot où les
+    gradients s'évanouissent et l'entraînement se bloque. Diviser par <code>√d_k</code> maintient les
+    scores dans une plage raisonnable. Les examinateurs adorent ce détail car il montre que vous êtes
+    allé au-delà du titre.
+  </p>
+
+  <h3>Pourquoi « douce » ? (soft vs hard)</h3>
+  <p>
+    Le mot « douce » s'oppose à « dure » (hard). Une recherche <strong>dure</strong>, comme une table de
+    hachage ou un dictionnaire, est du tout-ou-rien : une clé exacte renvoie <em>une seule</em> valeur
+    (poids 1 pour le gagnant, poids 0 pour tout le reste). Une recherche <strong>douce</strong> ne choisit
+    pas un gagnant : elle attribue à <em>chaque</em> token un poids continu entre 0 et 1 grâce au softmax,
+    et renvoie un <strong>mélange pondéré</strong> de toutes les Values.
+  </p>
+  <div class="callout">
+    <p>Trois raisons pour lesquelles c'est « doux » et non « dur » :</p>
+    <ul style="margin-bottom:0;">
+      <li><strong>C'est un mélange, pas un choix.</strong> La sortie est une moyenne pondérée de toutes les Values, pas une seule sélectionnée.</li>
+      <li><strong>Les poids sont continus.</strong> Le softmax produit une distribution lisse (p. ex. 0,7 / 0,25 / …) au lieu de valeurs binaires (0 ou 1).</li>
+      <li><strong>C'est différentiable</strong> — le point crucial. Choisir le max (recherche dure) crée des « marches » : un petit changement de poids ne change rien, puis bascule brutalement — impossible d'en tirer un gradient. La version douce réagit en douceur au moindre ajustement, donc la descente de gradient peut apprendre les bons poids. <em>Doux = lisse = différentiable = entraînable.</em></li>
+    </ul>
+  </div>
+  <p>
+    Exemple : le mot « elle » cherche son antécédent dans « Marie a dit à Sophie qu'elle… ». Une recherche
+    dure trancherait « c'est Marie, point ». La recherche douce dit plutôt « 70 % Marie, 25 % Sophie, 5 %
+    ailleurs » — et la nouvelle représentation de « elle » devient un mélange pondéré de ces vecteurs.
+  </p>
+
+  <h3>Attention causale (masquée)</h3>
+  <p>
+    Dans un LLM decoder-only, le token <em>i</em> ne peut prêter attention qu'aux tokens <em>≤ i</em> —
+    il ne peut pas voir le futur. C'est imposé par un <strong>masque causal</strong> : avant le softmax,
+    chaque score correspondant à une position future est fixé à <code>−∞</code>, si bien que son poids
+    devient nul. Ce masquage est précisément ce qui rend la prédiction du token suivant un signal
+    d'entraînement valide — le modèle ne peut pas tricher en jetant un œil à la réponse en avance.
+  </p>
+
+  <h3>Attention multi-têtes</h3>
+  <p>
+    Une seule opération d'attention capture un seul type de relation. L'attention <strong>multi-têtes</strong>
+    en exécute plusieurs en parallèle, chacune avec ses propres projections Q/K/V dans un sous-espace de
+    dimension réduite. Une tête peut suivre l'accord sujet-verbe, une autre la proximité de position, une
+    autre la coréférence. Leurs sorties sont concaténées puis reprojetées. Voyez-la comme plusieurs
+    spécialistes lisant la même phrase pour y repérer des motifs différents, puis mettant en commun
+    leurs notes.
+  </p>
+
+  <h3>Pourquoi c'est le nerf de la guerre : le piège de la complexité</h3>
+  <div class="callout warn">
+    <p>
+      <strong>La self-attention est en O(n²) par rapport à la longueur de séquence.</strong> Chaque token
+      prête attention à tous les autres, donc doubler le contexte quadruple à peu près le calcul et la
+      mémoire d'attention. Ce seul fait explique <em>pourquoi</em> le contexte long est coûteux, pourquoi
+      Flash Attention (qui ne matérialise jamais la matrice n×n complète) compte, et pourquoi le KV cache
+      existe. Si vous savez nommer le coût en O(n²), la plupart des questions d'architecture de Tier 1 en
+      découlent.
+    </p>
+  </div>
+
+  <h3>O(n²) en détail — d'où vient ce coût</h3>
+  <p>
+    La notation « grand O » décrit <strong>comment le coût grandit quand l'entrée grandit</strong> (ici
+    <em>n</em> = nombre de tokens). En <strong>O(n)</strong> (linéaire), doubler l'entrée double le coût.
+    En <strong>O(n²)</strong> (quadratique), doubler l'entrée <em>quadruple</em> le coût.
+  </p>
+  <table>
+    <thead>
+      <tr><th>n (tokens)</th><th>O(n)</th><th>O(n²)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>100</td><td>100</td><td>10 000</td></tr>
+      <tr><td>1 000</td><td>1 000</td><td>1 000 000</td></tr>
+      <tr><td>10 000</td><td>10 000</td><td>100 000 000</td></tr>
+    </tbody>
+  </table>
+  <p>
+    L'attention est en O(n²) parce que <strong>chaque token calcule un score avec chaque autre token</strong> :
+    <em>n</em> queries × <em>n</em> keys = <strong>n²</strong> paires. Cela forme une matrice n×n de scores,
+    dont chaque case est un produit scalaire à calculer :
+  </p>
+  <div class="diagram">
+    <pre><code>         token1  token2  token3  ...  tokenN
+token1   [  •       •       •           •   ]
+token2   [  •       •       •           •   ]
+token3   [  •       •       •           •   ]
+  ...    [                                   ]
+tokenN   [  •       •       •           •   ]
+
+  n × n cases « • »  →  double n, la surface quadruple</code></pre>
+  </div>
+  <div class="callout warn">
+    <p>
+      <strong>Le lien avec la génération token par token :</strong> prédire le token en position <em>k</em>
+      coûte ~k². Comme on génère toute une suite, le coût total est 1² + 2² + … + n², soit
+      <strong>O(n³)</strong> (cubique) pour une séquence entière — catastrophique. Le piège naïf : à chaque
+      nouveau token, on recalcule l'attention sur tous les précédents depuis zéro. Le <strong>KV cache</strong>
+      corrige ça en stockant les K et V passés (qui ne changent jamais) : chaque nouveau token ne calcule que
+      ses propres Q/K/V et fait porter sa query sur le cache → coût par token O(n²) → O(n), coût total
+      O(n³) → O(n²).
+    </p>
+  </div>
+
+  <div class="callout cat">
+    <h3>C.A.T. — « Déroulez-moi le mécanisme d'attention. »</h3>
+    <p><strong>Classify :</strong> « C'est l'opération centrale de mélange de séquence — une recherche pondérée douce sur la séquence. »</p>
+    <p><strong>Apply :</strong> « Chaque token émet une query, une key et une value. Les scores sont query·key, mis à l'échelle par √d_k, softmaxés en poids, puis utilisés pour moyenner les values. Le masquage causal met les scores futurs à −∞ pour qu'un decoder ne voie que le passé, et le multi-têtes exécute plusieurs de ces opérations en parallèle pour capturer différentes relations. »</p>
+    <p><strong>Trap :</strong> « Le coût est en O(n²) sur la longueur de séquence — c'est la raison pour laquelle le contexte long est coûteux, et la raison d'être du KV cache et de Flash Attention. »</p>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 2. KV CACHE -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>2 · Le KV cache</h2>
+  <span class="group-label">KV cache · Prefill vs decode · Mémoire · PagedAttention</span>
+
+  <h3>Le mécanisme en une phrase</h3>
+  <div class="callout">
+    <p>
+      <strong>Le KV cache stocke les vecteurs Key et Value de chaque token déjà traité, de sorte que
+      chaque nouveau token ne calcule que ses propres K et V — pas ceux de toute la séquence — à nouveau.</strong>
+    </p>
+  </div>
+
+  <p>
+    La génération est autorégressive : le modèle émet un token, l'ajoute, puis recommence. Naïvement,
+    l'étape <em>n</em> recalculerait l'attention sur les <em>n</em> tokens depuis zéro — transformant une
+    séquence en un travail total en O(n³). Mais les Keys et Values des tokens passés ne changent jamais
+    une fois calculés. On les met donc en cache. À chaque étape de decode, le modèle calcule Q/K/V pour
+    le <em>seul</em> nouveau token, ajoute ses K et V au cache, et fait porter son unique query sur toutes
+    les keys en cache. Le travail par étape passe de O(n²) à O(n).
+  </p>
+
+  <h3>Prefill vs decode — les deux phases</h3>
+  <table>
+    <thead>
+      <tr><th>Phase</th><th>Ce qui se passe</th><th>Goulot d'étranglement</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Prefill</strong></td>
+        <td>Traite tout le prompt en une passe parallèle ; remplit le KV cache. Produit le premier token.</td>
+        <td>Limité par le calcul (grosses multiplications matricielles) → détermine le <strong>TTFT</strong></td>
+      </tr>
+      <tr>
+        <td><strong>Decode</strong></td>
+        <td>Génère les tokens un par un, chacun lisant tout le KV cache.</td>
+        <td>Limité par la bande passante mémoire → détermine la <strong>latence inter-token</strong></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    Ce découpage explique pourquoi le time-to-first-token et la vitesse par token sont deux chiffres
+    différents avec deux correctifs différents, et c'est le pont entre les internes de Tier 1 et les
+    questions de serving de Tier 4.
+  </p>
+
+  <h3>Pourquoi il domine la mémoire</h3>
+  <div class="callout warn">
+    <p>
+      <strong>Le KV cache est le vrai gouffre mémoire à l'inférence, et il croît linéairement avec chaque
+      token de chaque requête concurrente.</strong> Sa taille ≈ 2 (K et V) × couches × têtes × head_dim ×
+      longueur_séquence × batch × octets. Un contexte long réparti sur de nombreux utilisateurs simultanés
+      peut dépasser les poids du modèle eux-mêmes en mémoire. C'est <em>pourquoi</em> GQA/MQA (partager K/V
+      entre les têtes de query pour réduire le cache) et PagedAttention/vLLM (allouer le cache en « pages »
+      non contiguës pour supprimer la fragmentation) existent. Relier le KV cache à une limite de mémoire
+      est le signal le plus fort que vous puissiez donner ici.
+    </p>
+  </div>
+
+  <div class="callout cat">
+    <h3>C.A.T. — « Qu'est-ce que le KV cache et pourquoi est-ce important ? »</h3>
+    <p><strong>Classify :</strong> « C'est l'optimisation au moment de l'inférence qui rend le decoding autorégressif faisable. »</p>
+    <p><strong>Apply :</strong> « Les vecteurs Key et Value des tokens passés ne changent pas, donc on les met en cache. Chaque nouveau token ne calcule que ses propres Q/K/V et fait porter l'attention sur le cache — le coût par étape passe de O(n²) à O(n). Le prefill remplit le cache en une passe parallèle ; le decode le lit un token à la fois. »</p>
+    <p><strong>Trap :</strong> « Le hic, c'est la mémoire — le cache croît avec la longueur de séquence multipliée par la taille du batch et peut éclipser les poids. C'est toute la motivation derrière GQA/MQA et PagedAttention. »</p>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 3. TOKENISATION -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>3 · La tokenisation</h2>
+  <span class="group-label">BPE · Sous-mots · Contexte = tokens · Bizarreries arithmétiques</span>
+
+  <h3>Le mécanisme en une phrase</h3>
+  <div class="callout">
+    <p>
+      <strong>La tokenisation découpe le texte en unités de sous-mots que le modèle voit réellement ;
+      le Byte-Pair Encoding (BPE) construit ce vocabulaire en fusionnant à répétition la paire de
+      symboles adjacents la plus fréquente.</strong>
+    </p>
+  </div>
+
+  <p>
+    Les modèles ne lisent ni caractères ni mots — ils lisent des <em>tokens</em>, des identifiants
+    entiers pointant vers un vocabulaire fixe (typiquement 50k–200k entrées). Le BPE part des
+    octets/caractères individuels et, sur le corpus d'entraînement, fusionne avidement la paire adjacente
+    la plus fréquente en un nouveau token, en répétant jusqu'à atteindre la taille de vocabulaire visée.
+    Résultat : les mots courants deviennent un seul token (« the »), les mots rares se fragmentent en
+    morceaux (« tokenization » → « token » + « ization »), et les chaînes vraiment nouvelles retombent
+    sur les octets. C'est un schéma de compression accordé au corpus.
+  </p>
+
+  <h3>Les pièges d'entretien</h3>
+  <table>
+    <thead>
+      <tr><th>Bizarrerie</th><th>Pourquoi cela se produit</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>L'arithmétique n'est pas fiable</td>
+        <td>« 12345 » peut être un token ou plusieurs ; il n'y a pas de représentation cohérente par chiffre, donc le calcul au niveau du chiffre n'a pas de structure propre à apprendre.</td>
+      </tr>
+      <tr>
+        <td>Le comptage de caractères échoue (« combien de r dans strawberry »)</td>
+        <td>Le modèle voit des tokens, pas des lettres — les caractères individuels à l'intérieur d'un token ne sont pas directement exposés.</td>
+      </tr>
+      <tr>
+        <td>La fenêtre de contexte se mesure en tokens, pas en caractères</td>
+        <td>Un « contexte de 200K » vaut 200K tokens ≈ 150K mots en anglais — mais bien moins pour le code, les écritures non latines ou les longs nombres, qui se tokenisent moins efficacement.</td>
+      </tr>
+      <tr>
+        <td>Le coût est au token</td>
+        <td>Les formats verbeux (JSON avec espaces) et les langues non latines consomment plus de tokens pour la même information — un vrai levier de coût.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <p>
+      <strong>Le piège :</strong> les tokens ne sont pas uniformes selon les langues ou le contenu. Le même
+      paragraphe en anglais, en allemand, ou en JSON minifié vs. formaté consomme des nombres de tokens très
+      différents. Ne jamais assimiler « tokens » à « mots » ou « caractères » en entretien — dites plutôt
+      « environ ¾ d'un mot pour l'anglais, mais ça varie beaucoup ».
+    </p>
+  </div>
+
+  <div class="callout cat">
+    <h3>C.A.T. — « Pourquoi les LLM peinent-ils avec l'arithmétique / le comptage de lettres ? »</h3>
+    <p><strong>Classify :</strong> « C'est un artefact de tokenisation, pas un échec de raisonnement. »</p>
+    <p><strong>Apply :</strong> « Le modèle opère sur des tokens de sous-mots issus d'un vocabulaire BPE, pas sur des caractères ou des chiffres. Un nombre comme 12345 peut être un seul token ou découpé arbitrairement, et les lettres à l'intérieur d'un token ne sont pas exposées individuellement — donc le calcul par chiffre et le comptage par lettre n'ont pas de représentation stable à apprendre. »</p>
+    <p><strong>Trap :</strong> « Cela signifie aussi que les fenêtres de contexte et le coût se mesurent en tokens, qui varient selon la langue et le format — le même texte peut représenter 2 à 3× plus de tokens dans une autre langue ou dans un JSON verbeux. »</p>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 4. SCALING LAWS -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>4 · Les scaling laws</h2>
+  <span class="group-label">Chinchilla · Compute-optimal · Capacités émergentes</span>
+
+  <h3>Le mécanisme en une phrase</h3>
+  <div class="callout">
+    <p>
+      <strong>La loss du modèle décroît de façon prévisible selon une loi de puissance en fonction de la
+      taille du modèle, de la taille du jeu de données et du compute — et Chinchilla a montré que la plupart
+      des grands modèles étaient nettement sous-entraînés en données par rapport à leur taille.</strong>
+    </p>
+  </div>
+
+  <p>
+    Les premiers travaux sur le scaling (Kaplan et al.) ont établi que la loss de test décroît de manière
+    lisse et prévisible à mesure que l'on augmente les paramètres, les données et le compute — des droites
+    sur une échelle log-log. L'article <strong>Chinchilla</strong> de 2022 (Hoffmann et al.) a affiné la
+    recette : pour un budget de compute fixé, les paramètres et les tokens d'entraînement devraient croître
+    <em>ensemble</em>, à peu près en proportion égale — environ <strong>20 tokens d'entraînement par
+    paramètre</strong>. Les modèles de l'ère GPT-3 étaient bien trop grands pour le peu de données qu'ils
+    voyaient ; un modèle plus petit entraîné sur plus de données (Chinchilla, 70B) a battu le bien plus
+    grand Gopher (280B). L'enseignement pratique que l'on retrouve partout : il vaut souvent mieux entraîner
+    un <em>modèle plus petit sur plus de données</em> qu'un modèle géant sur trop peu de données.
+  </p>
+
+  <h3>Compute-optimal vs. inference-optimal</h3>
+  <div class="callout warn">
+    <p>
+      <strong>Le rebondissement moderne :</strong> Chinchilla optimise le compute d'<em>entraînement</em>.
+      Mais un modèle servi à des millions d'utilisateurs est dominé par le coût d'<em>inférence</em>. Les
+      labos « sur-entraînent » donc délibérément des modèles plus petits au-delà du point de Chinchilla —
+      en dépensant davantage en amont pour obtenir un modèle petit et peu coûteux à servir. Nommer cette
+      tension (compute-optimal pour l'entraînement ≠ optimal pour le déploiement) est un signal fort de
+      Tier 1.
+    </p>
+  </div>
+
+  <h3>Capacités émergentes</h3>
+  <p>
+    Certaines capacités (arithmétique multi-étapes, apprentissage en contexte) semblent s'activer
+    brusquement au-delà d'un seuil d'échelle plutôt que de s'améliorer graduellement — l'« émergence ».
+    Prudence ici : il existe un débat vivant (Schaeffer et al.) selon lequel une partie de l'émergence
+    est un <strong>artefact de mesure</strong> — une métrique dure de type tout-ou-rien fait passer une
+    amélioration sous-jacente lisse pour un saut soudain. Mentionner cette nuance signale que vous suivez
+    la littérature, pas seulement le battage médiatique.
+  </p>
+
+  <div class="callout cat">
+    <h3>C.A.T. — « Que sont les scaling laws / qu'a changé Chinchilla ? »</h3>
+    <p><strong>Classify :</strong> « Les scaling laws sont la relation empirique en loi de puissance entre la loss et la taille du modèle, les données et le compute. »</p>
+    <p><strong>Apply :</strong> « Chinchilla a montré que, pour un budget de compute fixé, il faut faire croître ensemble les paramètres et les tokens — environ 20 tokens par paramètre. Les gros modèles antérieurs étaient sous-entraînés ; un modèle plus petit sur plus de données en a battu un bien plus grand. »</p>
+    <p><strong>Trap :</strong> « Chinchilla est compute-optimal pour l'<em>entraînement</em>. En production, le coût d'inférence domine, donc les labos sur-entraînent volontairement des modèles plus petits — moins coûteux à servir. Et méfiez-vous du terme "émergent" ; une partie relève d'un artefact de métrique. »</p>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- LE FIL CONDUCTEUR -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>Le fil qui relie tout le Tier 1</h2>
+  <div class="callout ok">
+    <p>
+      <strong>Tout revient au coût en O(n²) de l'attention.</strong> L'attention est une recherche douce
+      quadratique en longueur de séquence → ce coût impose le KV cache (et GQA, Flash Attention,
+      PagedAttention) à l'inférence → la tokenisation décide de ce qu'est même « n » et de l'efficacité avec
+      laquelle on remplit le contexte → les scaling laws vous disent quelle taille donner au modèle qui fait
+      tourner tout cela. Si vous savez tracer cette ligne, vous raisonnez sur la machine, vous ne récitez pas
+      des faits.
+    </p>
+  </div>
+
+  <!-- ── QUIZ ───────────────────────────────────────────────────────── -->
+  <div class="quiz">
+    <h2>Contrôle de restitution</h2>
+    <p style="color:var(--muted); font-size:0.9rem; margin-bottom:1rem;">Ne cherchez pas. Répondez de mémoire, à voix haute si possible.</p>
+
+    <div class="quiz-q" id="q1">
+      <p>1. Dans la formule d'attention, pourquoi diviser les scores Q·Kᵀ par √d_k ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Pour normaliser la sortie afin qu'elle somme à 1</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Pour garder les magnitudes des produits scalaires dans une plage raisonnable, afin que les gradients du softmax ne s'évanouissent pas</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Pour réduire le nombre de têtes d'attention nécessaires</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q2">
+      <p>2. Un masque causal s'applique en…</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…retirant complètement les tokens futurs de l'entrée</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">…fixant à −∞ les scores d'attention des positions futures avant le softmax</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…utilisant un encoder séparé pour le contexte futur</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q3">
+      <p>3. Que stocke réellement le KV cache ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Les tokens de sortie générés pour toute la session</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Les vecteurs Key et Value de chaque token déjà traité</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">La matrice de poids d'attention n×n complète</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q4">
+      <p>4. Quelle phase est limitée par le calcul et détermine le time-to-first-token ?</p>
+      <button class="quiz-option" onclick="answer(this,'correct')">Prefill</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Decode</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Aucune — le TTFT relève de la latence réseau</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q5">
+      <p>5. Pourquoi les LLM comptent-ils mal les lettres de « strawberry » ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Le mot est hors vocabulaire</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Un échec de raisonnement que le modèle corrigerait avec plus de paramètres</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Il voit des tokens de sous-mots, pas des caractères individuels</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q6">
+      <p>6. Le résultat phare de Chinchilla, c'est que pour un budget de compute fixé…</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…il faut toujours faire le modèle le plus grand possible</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">…il faut faire croître ensemble paramètres et tokens d'entraînement (~20 tokens/paramètre)</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">…la qualité des données d'entraînement n'affecte pas la loss finale</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q7">
+      <p>7. Le fait unique auquel remontent la plupart des questions d'architecture de Tier 1 :</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">La taille du vocabulaire est fixe</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">La self-attention est en O(n²) sur la longueur de séquence</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Les modèles sont entraînés avec une loss d'entropie croisée</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div id="score-banner" class="score-banner"></div>
+  </div>
+
+  <!-- ── SOURCES PRIMAIRES ───────────────────────────────────────────── -->
+  <h2>Sources primaires</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/1706.03762" target="_blank">Vaswani et al. — « Attention Is All You Need »</a> (le transformer / l'attention)</li>
+    <li><a href="https://arxiv.org/abs/2203.15556" target="_blank">Hoffmann et al. — « Training Compute-Optimal LLMs » (Chinchilla)</a></li>
+    <li><a href="https://arxiv.org/abs/2309.06180" target="_blank">Kwon et al. — « Efficient Memory Management for LLM Serving » (PagedAttention / vLLM)</a></li>
+    <li><a href="https://arxiv.org/abs/2304.15004" target="_blank">Schaeffer et al. — « Are Emergent Abilities a Mirage? »</a></li>
+  </ul>
+
+  <!-- ── ET ENSUITE ──────────────────────────────────────────────────── -->
+  <h2>Et ensuite</h2>
+  <p style="color:var(--muted); font-size:0.9rem;">
+    Cette vue d'ensemble prépare les sessions d'approfondissement. Dites « suivant » pour suivre le plan,
+    ou choisissez une session :
+  </p>
+  <ul>
+    <li><a href="0005-kv-cache-fr.html">S05 — KV cache en profondeur</a> : structure, calcul de mémoire, GQA/MQA, PagedAttention</li>
+    <li><a href="0006-tokenization-bpe-quirks-fr.html">S06 — Tokenisation en profondeur</a> : BPE pas à pas, bizarreries arithmétiques, coût et fenêtre de contexte</li>
+    <li><strong>S18 — Scaling laws en profondeur :</strong> les maths de Chinchilla et le virage inference-optimal</li>
+    <li><a href="0004-tier1-how-llms-think.html">→ Version anglaise de cette leçon</a></li>
+    <li><a href="0003-llm-primitives-map.html">← Retour à la Carte des primitives</a></li>
+    <li><a href="0002-interview-framework.html">← Leçon 2 — Le cadre C.A.T.</a></li>
+  </ul>
+
+  <div class="ask-teacher">
+    <strong>Posez n'importe quelle question à votre professeur.</strong> Vous voulez le déroulé complet de
+    l'attention avec un exemple numérique ? Vous voulez répéter l'une de ces réponses C.A.T. à voix haute
+    et obtenir un retour ? Dites-le simplement.
+  </div>
+
+</main>
+
+<script>
+  let answered = {};
+  const TOTAL = 7;
+  const feedbacks = {
+    correct: "Correct.",
+    wrong: "Pas tout à fait — relisez la section ci-dessus et réessayez."
+  };
+
+  function answer(btn, result) {
+    const qDiv = btn.closest('.quiz-q');
+    const qId = qDiv.id;
+    if (answered[qId]) return;
+    answered[qId] = result;
+
+    qDiv.querySelectorAll('.quiz-option').forEach(b => b.disabled = true);
+    btn.classList.add(result);
+    qDiv.querySelector('.quiz-feedback').textContent = feedbacks[result];
+
+    if (Object.keys(answered).length === TOTAL) {
+      const correct = Object.values(answered).filter(v => v === 'correct').length;
+      const banner = document.getElementById('score-banner');
+      banner.textContent = correct >= 6
+        ? `${correct}/${TOTAL} — solide. Vous raisonnez sur la machine, vous ne la récitez pas.`
+        : `${correct}/${TOTAL} — revoyez les erreurs, puis essayez d'expliquer le fil O(n²) à voix haute.`;
+      banner.classList.add('show', correct >= 6 ? 'pass' : 'fail');
+    }
+  }
+</script>
+</body>
+</html>
