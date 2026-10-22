@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lesson 10 — DPO: How It Replaces PPO and Why</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <style>
+    .diagram {
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.25rem;
+      margin: 0 0 1.5rem;
+      overflow-x: auto;
+    }
+    .group-label {
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: #fff;
+      background: #1e4d3a;
+      display: inline-block;
+      padding: 0.2rem 0.6rem;
+      border-radius: 4px;
+      margin-bottom: 0.6rem;
+    }
+    .cat { border-left: 4px solid var(--ok); }
+    .cat h3 { margin-top: 0.3rem; }
+    .mono { font-family: var(--mono); font-size: 0.88rem; }
+    .comparison-table { margin: 1rem 0; }
+    .comparison-table td { vertical-align: top; }
+    .comparison-table th { text-align: left; }
+  </style>
+</head>
+<body>
+<main>
+
+  <div class="lesson-meta">Lesson 10 · LLM Fundamentals · Tier 2 — How LLMs Learn</div>
+  <h1>DPO: How It Replaces PPO and Why</h1>
+  <p style="color:var(--muted); font-size:0.9rem; margin-bottom:2rem;">~22 min · Interview target: explain why DPO simplifies RLHF, derive the DPO loss, and justify its advantages (stability, cost, simplicity)</p>
+
+  <!-- ── WHY THIS TOPIC ──────────────────────────────────────────── -->
+  <div class="callout">
+    <p>
+      <strong>DPO (Direct Preference Optimization) is the answer to RLHF's limitations.</strong> 
+      Where RLHF requires three models in memory (policy, reference, reward model) and complex RL 
+      training with PPO, DPO achieves the same goal <em>with a single supervised loss</em>.
+      It's the preferred alignment method for most labs in 2024-2025 — and an interview question that 
+      separates those who know RLHF from those who understand <em>why</em> we want to move beyond it.
+    </p>
+  </div>
+
+  <p>
+    This lesson covers: <strong>the problem DPO solves</strong>, <strong>deriving the DPO loss</strong> 
+    from the RLHF objective, <strong>its practical advantages</strong>, and <strong>its limitations and when 
+    to still use RLHF</strong>.
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 1. THE PROBLEM WITH RLHF -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>1 · The Problem with RLHF: Cost, Complexity, Instability</h2>
+  <span class="group-label">RLHF = 3 models + PPO + KL</span>
+
+  <div class="callout warn">
+    <p>
+      <strong>RLHF is effective, but it's an engineering nightmare.</strong> For each update:
+    </p>
+  </div>
+
+  <div class="diagram">
+    <pre><code>RLHF requires in memory simultaneously:
+┌─────────────────────────────────────────────────────────────┐
+│  1. π_θ      → trained policy (the LLM, updated)                 │
+│  2. π_ref    → reference model (frozen, usually SFT version)    │
+│  3. r_φ      → reward model (frozen, trained on pairs)          │
+└─────────────────────────────────────────────────────────────┘
+
+PPO Objective: E[ r_φ(x,y) ] − β·KL(π_θ ‖ π_ref)
+
+Problems:
+  • 3× GPU memory (or complex pipeline)
+  • PPO is sensitive: β, clipping ε, learning rate
+  • Instability: policy can diverge catastrophically
+  • Cost: thousands of GPU-hours for medium-sized models</code></pre>
+  </div>
+
+  <p>
+    The DPO insight: <strong>what if we could rewrite this objective to eliminate the reward model and PPO?</strong>
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 2. THE DPO INTUITION -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>2 · The Key Intuition: Optimize Preferences Directly</h2>
+  <span class="group-label">(chosen, rejected) pairs → Supervised loss</span>
+
+  <div class="callout">
+    <p>
+      <strong>DPO starts with a simple observation:</strong> in RLHF, we already have pairs (y_w, y_l) 
+      where y_w is preferred over y_l. Instead of learning a reward model to predict this preference, 
+      then optimizing the policy against that RM... <em>why not learn to prefer y_w over y_l directly?</em>
+    </p>
+  </div>
+
+  <p>
+    The DPO magic formula (Rafailov et al., 2023):
+  </p>
+
+  <div class="diagram">
+    <pre><code>DPO Loss:
+
+  L_DPO(θ) = − E_{(x,y_w,y_l)} [ log σ( β log π_θ(y_w|x) − β log π_θ(y_l|x) ) ]
+
+  where σ = sigmoid
+      β = temperature coefficient (replaces RLHF's β KL)
+      π_θ = trained model
+
+Interpretation:
+  We want log π_θ(y_w|x) − log π_θ(y_l|x) to be LARGE and POSITIVE
+  → probability of preferred response should be higher
+  → sigmoid transforms this difference into probability [0,1]
+  → we maximize this probability via log-likelihood</code></pre>
+  </div>
+
+  <p>
+    The beauty of this formula: <strong>it only needs two models</strong>:
+  </p>
+  <ul>
+    <li><strong>π_θ</strong>: the trained model (updated)</li>
+    <li><strong>π_ref</strong>: the reference model (frozen, usually SFT version)</li>
+  </ul>
+  <p>
+    <strong>No reward model. No PPO. No RL.</strong> Just a standard supervised loss.
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 3. THE DERIVATION -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>3 · The Derivation: From RLHF to DPO</h2>
+  <span class="group-label">Rewriting the RLHF objective</span>
+
+  <div class="callout">
+    <p>
+      <strong>The mathematical trick:</strong> we can show that the RLHF objective with KL constraint is 
+      equivalent to maximizing the probability that the preferred response has higher probability 
+      than the rejected response, <em>under the trained model</em>.
+    </p>
+  </div>
+
+  <div class="diagram">
+    <pre><code>RLHF Objective:
+  max_θ E[ r_φ(x,y) ] − β KL(π_θ ‖ π_ref)
+
+Key rewrite (via logistic regression lemma):
+  r_φ(x,y) = β log ( π_θ(y|x) / π_ref(y|x) )
+
+Substitute into RLHF objective:
+  max_θ E[ β log (π_θ(y_w|x)/π_ref(y_w|x)) ] − β KL(π_θ ‖ π_ref)
+
+Simplification (see DPO paper for details):
+  max_θ E[ log σ( β log (π_θ(y_w|x)/π_ref(y_w|x)) − β log (π_θ(y_l|x)/π_ref(y_l|x)) ) ]
+
+Final DPO form:
+  L_DPO = − E[ log σ( β log (π_θ(y_w|x)/π_ref(y_w|x)) − β log (π_θ(y_l|x)/π_ref(y_l|x)) ) ]
+
+Note: π_ref appears in the loss, but is NOT updated.</code></pre>
+  </div>
+
+  <p>
+    The full derivation requires several algebra steps and the assumption that the reward model 
+    follows a particular form (logistic regression on log-probabilities). The result is elegant: 
+    <strong>we've transformed an RL problem into a standard supervised learning problem</strong>.
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 4. DPO ADVANTAGES -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>4 · DPO Advantages: Why Everyone is Adopting It</h2>
+
+  <table class="comparison-table">
+    <thead>
+      <tr><th>Criteria</th><th>RLHF (PPO)</th><th>DPO</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Models in memory</strong></td>
+        <td>3 (policy + reference + RM)</td>
+        <td>2 (policy + reference)</td>
+      </tr>
+      <tr>
+        <td><strong>Training type</strong></td>
+        <td>RL (PPO) + supervision (RM)</td>
+        <td>Pure supervision</td>
+      </tr>
+      <tr>
+        <td><strong>Stability</strong></td>
+        <td>Sensitive to hyperparameters (β, ε, lr)</td>
+        <td>Stable like standard fine-tuning</td>
+      </tr>
+      <tr>
+        <td><strong>Computational cost</strong></td>
+        <td>High (intensive sampling)</td>
+        <td>Low (like SFT)</td>
+      </tr>
+      <tr>
+        <td><strong>Implementation</strong></td>
+        <td>Complex (RL pipeline)</td>
+        <td>Simple (standard PyTorch loss)</td>
+      </tr>
+      <tr>
+        <td><strong>Hyperparameter tuning</strong></td>
+        <td>Difficult (multiple interacting parameters)</td>
+        <td>Simple (mainly β)</td>
+      </tr>
+      <tr>
+        <td><strong>Final performance</strong></td>
+        <td>Excellent (gold standard)</td>
+        <td>Comparable (often better in practice)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <p>
+      <strong>The bottom line:</strong> DPO achieves 80% of what RLHF does, with 20% of the complexity and cost. 
+      That's why it's become the default alignment method for most new models.
+    </p>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 5. DPO LIMITATIONS -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>5 · Limitations and When RLHF is Still Useful</h2>
+  <span class="group-label">When DPO falls short</span>
+
+  <div class="callout warn">
+    <p>
+      <strong>DPO is not a universal solution.</strong> There are scenarios where RLHF remains 
+      superior or necessary.
+    </p>
+  </div>
+
+  <table class="comparison-table">
+    <thead>
+      <tr><th>DPO Limitation</th><th>Explanation</th><th>Solution / Workaround</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>RM form assumption</strong></td>
+        <td>DPO assumes RM follows logistic regression form on log-probs</td>
+        <td>Works well in practice, but not always theoretically valid</td>
+      </tr>
+      <tr>
+        <td><strong>Preference data</strong></td>
+        <td>Requires high-quality (chosen, rejected) pairs</td>
+        <td>Same problem as RLHF; RLAIF can help</td>
+      </tr>
+      <tr>
+        <td><strong>Multi-objective optimization</strong></td>
+        <td>Hard to incorporate multiple reward signals</td>
+        <td>RLHF + multiple reward models remains more flexible</td>
+      </tr>
+      <tr>
+        <td><strong>Very large models</strong></td>
+        <td>The π_θ/π_ref ratio can underflow numerically</td>
+        <td>Stabilization techniques (clipping, normalization)</td>
+      </tr>
+      <tr>
+        <td><strong>Online learning</strong></td>
+        <td>DPO is designed for offline (batch) training</td>
+        <td>RLHF can be adapted for continuous learning</td>
+      </tr>
+      <tr>
+        <td><strong>Interpretability</strong></td>
+        <td>No explicit reward model → harder to debug</td>
+        <td>Post-hoc analysis of learned preferences</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    <strong>When to still use RLHF?</strong>
+  </p>
+  <ul>
+    <li>When you already have a well-tuned RLHF pipeline and stability isn't an issue</li>
+    <li>When you need to optimize complex, multiple objectives</li>
+    <li>When you want an explicit reward model for analysis or debugging</li>
+    <li>For research models where maximum performance trumps cost</li>
+  </ul>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 6. PRACTICAL IMPLEMENTATION -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>6 · Practical Implementation: What You Need to Know</h2>
+  <span class="group-label">Interview tips and tricks</span>
+
+  <div class="diagram">
+    <pre><code>Pseudo-code DPO (PyTorch-like):
+
+# Inputs:
+#   model       = π_θ (trained model, with grads)
+#   ref_model   = π_ref (reference model, no grads)
+#   batch       = (x, y_w, y_l) preference pairs
+#   beta        = hyperparameter (typically 0.1 to 0.5)
+
+for x, y_w, y_l in batch:
+    # Compute log-probs
+    log_p_w = model.log_prob(x, y_w)  # log π_θ(y_w|x)
+    log_p_l = model.log_prob(x, y_l)  # log π_θ(y_l|x)
+    
+    log_p_ref_w = ref_model.log_prob(x, y_w)  # log π_ref(y_w|x)
+    log_p_ref_l = ref_model.log_prob(x, y_l)  # log π_ref(y_l|x)
+    
+    # Log probability ratios (numerically stabilized)
+    log_ratio_w = log_p_w - log_p_ref_w
+    log_ratio_l = log_p_l - log_p_ref_l
+    
+    # Difference for DPO
+    logits = beta * (log_ratio_w - log_ratio_l)
+    
+    # Loss = -log σ(logits)
+    loss = -F.logsigmoid(logits).mean()
+    
+    loss.backward()
+    optimizer.step()</code></pre>
+  </div>
+
+  <p>
+    <strong>Key points for interviews:</strong>
+  </p>
+  <ul>
+    <li><strong>β (beta)</strong>: Controls alignment strength. Too high → model drifts from SFT. Too low → little learning.</li>
+    <li><strong>Numerical stabilization</strong>: Log-probs can be very negative. Use <code>logaddexp</code> or clipping.</li>
+    <li><strong>Batch composition</strong>: Good ratio of positive/negative pairs is crucial.</li>
+    <li><strong>Evaluation</strong>: Always evaluate with human preference metrics, not just DPO loss.</li>
+  </ul>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 7. INTERVIEW TRAPS -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>7 · Interview Traps</h2>
+
+  <table>
+    <thead>
+      <tr><th>Trap</th><th>The Right Answer</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>"DPO is just SFT with pairs"</td>
+        <td>No: DPO has a specific loss that optimizes the <em>difference</em> in probability between y_w and y_l, not just the probability of y_w.</td>
+      </tr>
+      <tr>
+        <td>"DPO doesn't need a reference model"</td>
+        <td>False: π_ref appears in the DPO loss. Without it, we lose the anchor that prevents drift.</td>
+      </tr>
+      <tr>
+        <td>"DPO is always better than RLHF"</td>
+        <td>No: RLHF remains useful for complex cases (multi-objective, very large models). DPO is <em>often</em> better in practice.</td>
+      </tr>
+      <tr>
+        <td>"DPO completely eliminates reward hacking"</td>
+        <td>No: reward hacking can still occur if preference data is biased. DPO reduces the risk but doesn't eliminate it.</td>
+      </tr>
+      <tr>
+        <td>"DPO is faster because there's no RM"</td>
+        <td>Partially true: we save RM training cost, but inference to compute log-probs remains expensive.</td>
+      </tr>
+      <tr>
+        <td>"DPO and RLHF give exactly the same results"</td>
+        <td>No: they are <em>conceptually</em> related, but not identical. DPO makes an approximation that works well in practice.</td>
+      </tr>
+      <tr>
+        <td>"β in DPO = β in RLHF"</td>
+        <td>No: these are different parameters, even though they play similar roles (alignment strength control).</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- C.A.T. -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <div class="callout cat">
+    <h3>C.A.T. — "Explain DPO and why it replaces PPO."</h3>
+    <p><strong>Classify:</strong> "DPO is an alignment method that learns directly from human preferences without using a reward model or RL."</p>
+    <p><strong>Apply:</strong> "We start with the SFT model as reference. For each (preferred y_w, rejected y_l) pair for the same instruction x, we compute the DPO loss that pushes the probability of y_w to be higher than y_l, while staying close to the reference model. The formula is L_DPO = −E[log σ(β log(π_θ(y_w|x)/π_ref(y_w|x)) − β log(π_θ(y_l|x)/π_ref(y_l|x)))] where β controls the alignment strength."</p>
+    <p><strong>Trap:</strong> "The key point is that we eliminate the reward model and PPO: we go from 3 models in memory to 2, and from unstable RL training to simple supervision. That's why DPO has become the default method — it achieves 80% of RLHF's results with 20% of the complexity."</p>
+  </div>
+
+  <div class="callout cat">
+    <h3>C.A.T. — "What's the fundamental difference between RLHF and DPO?"</h3>
+    <p><strong>Classify:</strong> "RLHF uses a reward model and RL (PPO) with a KL constraint. DPO uses a supervised loss directly on preference pairs."</p>
+    <p><strong>Apply:</strong> "RLHF requires three models: the trained policy, the reference model for KL, and the reward model for the reward. The objective is E[r_φ] − β·KL. DPO only needs two models: the policy and the reference. The DPO loss is derived by rewriting the RLHF objective to eliminate the RM, resulting in a formula that directly optimizes the probability difference between preferred and rejected responses."</p>
+    <p><strong>Trap:</strong> "The trap would be to think DPO is completely different. In reality, DPO is an <em>approximation</em> of RLHF under certain assumptions. The difference is in the implementation, not the final goal."</p>
+  </div>
+
+  <div class="callout cat">
+    <h3>C.A.T. — "Why is DPO more stable than RLHF?"</h3>
+    <p><strong>Classify:</strong> "Because DPO transforms an RL problem into a standard supervised learning problem."</p>
+    <p><strong>Apply:</strong> "PPO is an RL algorithm that requires careful tuning of learning rate, clipping ε, and KL constraint coefficient β. Poor configuration can cause the policy to diverge. DPO, on the other hand, uses simple gradient descent on a modified cross-entropy loss. It's as stable as standard supervised fine-tuning."</p>
+    <p><strong>Trap:</strong> "The stability doesn't come from magic: it comes from eliminating the sources of instability (PPO, imperfect RM) while keeping the essential (preference optimization with reference model anchoring)."</p>
+  </div>
+
+  <!-- ── QUIZ ───────────────────────────────────────────────────────── -->
+  <div class="quiz">
+    <h2>Retrieval Check</h2>
+    <p style="color:var(--muted); font-size:0.9rem; margin-bottom:1rem;">Don't look things up. Answer from memory, out loud if possible.</p>
+
+    <div class="quiz-q" id="q1">
+      <p>1. How many models are needed for DPO (during training)?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">1 (only the policy)</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">3 (policy + reference + RM)</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">2 (policy + reference)</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q2">
+      <p>2. What is the main difference between RLHF and DPO?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">DPO uses a simpler reward model</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">DPO eliminates the reward model and PPO, using a supervised loss</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">DPO is slower but more precise</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q3">
+      <p>3. What does the DPO loss do?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">It maximizes the probability of the preferred response</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">It maximizes the probability difference between preferred and rejected responses</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">It minimizes the KL divergence between policy and reference</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q4">
+      <p>4. Why is DPO more stable than RLHF?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Because it uses a better reward model</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Because it transforms an RL problem into standard supervision</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Because it has more hyperparameters to tune</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q5">
+      <p>5. What role does β play in the DPO loss?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">It controls the learning rate</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">It controls the alignment strength (temperature)</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">It determines the number of PPO iterations</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q6">
+      <p>6. True or False: DPO completely eliminates reward hacking</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">True</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">False — it reduces but doesn't eliminate it</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q7">
+      <p>7. What is DPO's main practical advantage over RLHF?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Better final performance</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Simplicity and reduced cost</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">No need for preference data</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q8">
+      <p>8. In the DPO loss, which model is updated?</p>
+      <button class="quiz-option" onclick="answer(this,'correct')">π_θ (the policy)</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">π_ref (the reference)</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Both are updated</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div id="score-banner" class="score-banner"></div>
+  </div>
+
+  <!-- ── PRIMARY SOURCES ───────────────────────────────────────────── -->
+  <h2>Primary Sources</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2305.18895" target="_blank">Rafailov et al. — "Direct Preference Optimization: Your Language Model is Secretly a Reward Model"</a> (original DPO paper)</li>
+    <li><a href="https://arxiv.org/abs/2009.01325" target="_blank">Stiennon et al. — "Learning to Summarize from Human Feedback"</a> (RLHF context)</li>
+    <li><a href="https://arxiv.org/abs/2203.02155" target="_blank">Ouyang et al. — "Training Language Models to Follow Instructions with Human Feedback"</a> (InstructGPT, RLHF)</li>
+    <li><a href="https://huggingface.co/blog/dpo" target="_blank">Hugging Face Blog — "DPO: Direct Preference Optimization"</a> (practical tutorial)</li>
+    <li><a href="https://github.com/huggingface/trl/blob/main/trl/trainer/dpo_trainer.py" target="_blank">DPO implementation in TRL</a> (reference code)</li>
+  </ul>
+
+  <!-- ── WHAT'S NEXT ──────────────────────────────────────────────────── -->
+  <h2>What's next</h2>
+  <p style="color:var(--muted); font-size:0.9rem;">
+    Say "next" to follow the plan, or choose a session:
+  </p>
+  <ul>
+    <li><strong>S11 — LoRA / QLoRA:</strong> fine-tuning without the full compute cost (Tier 2)</li>
+    <li><a href="0009-rlhf-fr.html">S09 — RLHF:</a> reward model, PPO and KL constraint</li>
+    <li><a href="0003-llm-primitives-map.html">← Back to the Primitives Map</a></li>
+    <li><a href="0002-interview-framework.html">← Lesson 2 — The C.A.T. Framework</a></li>
+  </ul>
+
+  <div class="ask-teacher">
+    <strong>Ask your teacher anything.</strong> Want to walk through the mathematical derivation of DPO, 
+    compare RLHF vs DPO implementations, or practice a C.A.T. answer out loud and get feedback? 
+    Just say so.
+  </div>
+
+</main>
+
+<script>
+  let answered = {};
+  const TOTAL = 8;
+  const feedbacks = {
+    correct: "Correct.",
+    wrong: "Not quite — reread the section above and try again."
+  };
+
+  function answer(btn, result) {
+    const qDiv = btn.closest('.quiz-q');
+    const qId = qDiv.id;
+    if (answered[qId]) return;
+    answered[qId] = result;
+
+    qDiv.querySelectorAll('.quiz-option').forEach(b => b.disabled = true);
+    btn.classList.add(result);
+    qDiv.querySelector('.quiz-feedback').textContent = feedbacks[result];
+
+    if (Object.keys(answered).length === TOTAL) {
+      const correct = Object.values(answered).filter(v => v === 'correct').length;
+      const banner = document.getElementById('score-banner');
+      banner.textContent = correct >= 7
+        ? `${correct}/${TOTAL} — excellent. You've mastered DPO and its advantages over RLHF.`
+        : correct >= 5
+          ? `${correct}/${TOTAL} — good. Review the DPO loss and stability points.`
+          : `${correct}/${TOTAL} — reread the lesson, then explain RLHF vs DPO out loud.`;
+      banner.classList.add('show', correct >= 7 ? 'pass' : correct >= 5 ? 'partial' : 'fail');
+    }
+  }
+</script>
+</body>
+</html>
