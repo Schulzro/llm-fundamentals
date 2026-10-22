@@ -1,0 +1,697 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Leçon 11 — LoRA / QLoRA : fine-tuning sans le coût complet</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <style>
+    .diagram {
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.25rem;
+      margin: 0 0 1.5rem;
+      overflow-x: auto;
+    }
+    .group-label {
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: #fff;
+      background: #4a1e5f;
+      display: inline-block;
+      padding: 0.2rem 0.6rem;
+      border-radius: 4px;
+      margin-bottom: 0.6rem;
+    }
+    .cat { border-left: 4px solid var(--ok); }
+    .cat h3 { margin-top: 0.3rem; }
+    .mono { font-family: var(--mono); font-size: 0.88rem; }
+    .comparison-table { margin: 1rem 0; }
+    .comparison-table td { vertical-align: top; }
+    .comparison-table th { text-align: left; }
+    .lora-visual {
+      display: flex;
+      gap: 2rem;
+      align-items: flex-start;
+      margin: 1rem 0;
+    }
+    .lora-part {
+      flex: 1;
+    }
+    .matrix {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 0.5rem;
+      font-family: var(--mono);
+      font-size: 0.85rem;
+      margin: 0.5rem 0;
+    }
+  </style>
+</head>
+<body>
+<main>
+
+  <div class="lesson-meta">Leçon 11 · Fondamentaux des LLM · Tier 2 — Comment les LLM apprennent</div>
+  <h1>LoRA / QLoRA : fine-tuning sans le coût complet</h1>
+  <p style="color:var(--muted); font-size:0.9rem; margin-bottom:2rem;">~25 min · Objectif entretien : expliquer le mécanisme de LoRA, la quantification dans QLoRA, et justifier leurs avantages (mémoire, coût, flexibilité)</p>
+
+  <!-- ── POURQUOI CE SUJET ──────────────────────────────────────────── -->
+  <div class="callout">
+    <p>
+      <strong>LoRA et QLoRA sont les techniques qui ont démocratisé le fine-tuning des grands modèles.</strong> 
+      Avant LoRA, fine-tuner un modèle de 70B paramètres nécessitait des dizaines de GPU A100. 
+      Avec LoRA, on peut le faire sur un seul GPU. Avec QLoRA, même sur une carte grand public. 
+      En entretien, c'est la question PEFT (Parameter-Efficient Fine-Tuning) la plus fréquente — 
+      et celle qui montre que vous comprenez les compromis entre performance et ressources.
+    </p>
+  </div>
+
+  <p>
+    Cette leçon couvre : <strong>le problème du fine-tuning complet</strong>, 
+    <strong>le mécanisme de LoRA (Low-Rank Adaptation)</strong>, 
+    <strong>l'ajout de la quantification dans QLoRA</strong>, 
+    puis <strong>les cas d'usage, avantages et limites</strong>.
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 1. LE PROBLÈME : FINE-TUNING COMPLET -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>1 · Le problème : le fine-tuning complet est prohibitif</h2>
+  <span class="group-label">Mémoire · Coût · Catastrophic Forgetting</span>
+
+  <div class="callout warn">
+    <p>
+      <strong>Fine-tuner un LLM de taille moyenne (7B-70B) nécessite des ressources énormes.</strong>
+    </p>
+  </div>
+
+  <div class="diagram">
+    <pre><code>Coût du fine-tuning complet pour un modèle de 70B paramètres :
+
+Mémoire (FP16) :
+  • Paramètres du modèle      : 70B × 2 bytes = 140 Go
+  • Gradients                : 140 Go
+  • Optimizer states (Adam)  : 140 Go × 2 = 280 Go
+  • Activation checkpointing : ~140 Go
+  └─────────────────────────────────────────────┘
+                              Total : ~700 Go par GPU
+
+Nombre de GPU nécessaires :
+  • A100 (40 Go)  : 700 / 40 = 17.5 → 18 GPU minimum
+  • A100 (80 Go)  : 700 / 80 = 8.75 → 9 GPU minimum
+  • H100 (80 Go)  : même calcul
+
+Coût estimé (cloud) :
+  • 9 × A100 @ $3/h = $27/h
+  • Pour 1 époque sur 100k exemples : ~$2,700
+  • Pour un entraînement complet : $10,000-$50,000+
+
+Problèmes supplémentaires :
+  • Catastrophic forgetting : le modèle oublie ses connaissances générales
+  • Temps d'entraînement : des heures à des jours
+  • Stockage : besoin de sauvegarder le modèle complet</code></pre>
+  </div>
+
+  <p>
+    <strong>La solution :</strong> ne pas entraîner tous les paramètres, mais seulement une petite partie 
+    qui capture les adaptations nécessaires pour la tâche.
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 2. L'INTUITION LORA -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>2 · L'intuition LoRA : adapter avec des matrices de faible rang</h2>
+  <span class="group-label">Low-Rank Adaptation · ΔW = BA</span>
+
+  <div class="callout">
+    <p>
+      <strong>LoRA (Hu et al., 2021) part d'une hypothèse simple :</strong> 
+      les poids d'un modèle pré-entraîné n'ont pas besoin d'être mis à jour de manière arbitraire. 
+      Les changements nécessaires pour une tâche spécifique peuvent être représentés par des 
+      <em>matrices de faible rang</em>.
+    </p>
+  </div>
+
+  <p>
+    Au lieu de mettre à jour W directement, LoRA <strong>gèle</strong> les poids originaux W et ajoute 
+    une adaptation de faible rang :
+  </p>
+
+  <div class="diagram lora-visual">
+    <div class="lora-part">
+      <p style="text-align: center; margin-bottom: 0.5rem;"><strong>Avant LoRA</strong></p>
+      <div class="matrix" style="font-size: 1.2rem;">
+        W<br>(d×k)
+      </div>
+      <p style="text-align: center; font-size: 0.85rem;">Tous les paramètres<br>sont mis à jour</p>
+    </div>
+    <div style="font-size: 2rem; color: var(--muted);">→</div>
+    <div class="lora-part">
+      <p style="text-align: center; margin-bottom: 0.5rem;"><strong>Avec LoRA</strong></p>
+      <div style="display: flex; gap: 0.5rem; justify-content: center;">
+        <div class="matrix" style="font-size: 0.9rem;">
+          W<br>(d×k)<br><span style="font-size: 0.7rem;">figé</span>
+        </div>
+        <span style="font-size: 1.5rem;">+</span>
+        <div class="matrix" style="font-size: 0.9rem;">
+          BA<br>(d×r)(r×k)<br><span style="font-size: 0.7rem;">entraîné</span>
+        </div>
+      </div>
+      <p style="text-align: center; font-size: 0.85rem;">Seulement BA est mis à jour<br>r ≪ d,k (typiquement r=8, 16, 32, 64)</p>
+    </div>
+  </div>
+
+  <div class="diagram">
+    <pre><code>Formule LoRA :
+
+  h = Wx + ΔWx        où ΔW = BA
+  h = Wx + BAx
+
+  W  ∈ ℝ^{d×k}  : poids originaux (figés)
+  B  ∈ ℝ^{d×r}  : matrice de projection (entraînée)
+  A  ∈ ℝ^{r×k}  : matrice d'expansion (entraînée)
+  r  : rang (hyperparamètre, typiquement 8-64)
+
+Nombre de paramètres entraînables :
+  • Sans LoRA : d × k
+  • Avec LoRA : (d × r) + (r × k) = r × (d + k)
+  
+Réduction :
+  • Si r=8, d=4096, k=4096 : 8×(4096+4096) = 65,536 vs 16,777,216
+  • Ratio : 65K / 16M = 0.4% des paramètres !</code></pre>
+  </div>
+
+  <p>
+    <strong>Où appliquer LoRA ?</strong> Typiquement sur les matrices de projection dans l'attention :
+  </p>
+  <ul>
+    <li><strong>Q, K, V, O</strong> dans les couches d'attention (self-attention)</li>
+    <li>Parfois aussi sur les couches feed-forward (MLP)</li>
+    <li>Pas sur les embeddings ou le LayerNorm (peu de gains)</li>
+  </ul>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 3. QLORA : AJOUTER LA QUANTIFICATION -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>3 · QLoRA : ajouter la quantification pour aller plus loin</h2>
+  <span class="group-label">4-bit NormalFloat · Double Quantification</span>
+
+  <div class="callout">
+    <p>
+      <strong>QLoRA (Dettmers et al., 2023) combine LoRA avec la quantification pour réduire encore plus 
+      la mémoire.</strong> L'idée : quantifier le modèle de base (figé) en 4 bits, et n'entraîner que 
+      les adapteurs LoRA en 16 bits.
+    </p>
+  </div>
+
+  <div class="diagram">
+    <pre><code>Quantification 4-bit NormalFloat (NF4) :
+
+  • Les poids sont stockés en 4 bits (16 valeurs possibles)
+  • Mais les calculs se font en float16/float32
+  • Technique de déquantification à la volée
+
+  Mémoire pour un modèle de 70B :
+    • Sans quantification (FP16) : 70B × 2 = 140 Go
+    • Avec NF4               : 70B × 0.5 = 35 Go
+    • Gain                   : 4× moins de mémoire
+
+  QLoRA = LoRA + Quantification :
+    • Modèle de base          : 4 bits (figé, non entraîné)
+    • Adapteurs LoRA          : 16 bits (entraînés)
+    • Activations             : 16 bits (pendant le forward)
+    • Gradients               : 16 bits (pendant le backward)
+    
+    Mémoire totale pour 70B : ~40-50 Go (vs 700 Go sans LoRA/QLoRA)
+    → Tient sur un seul GPU A100 (40 Go) ou même RTX 4090 (24 Go) !</code></pre>
+  </div>
+
+  <p>
+    <strong>Double Quantification (pour les très grands modèles) :</strong>
+  </p>
+  <ul>
+    <li>Quantifier une première fois les poids en 8 bits</li>
+    <li>Quantifier une deuxième fois les poids déjà quantifiés en 4 bits</li>
+    <li>Permet de réduire encore la mémoire sans perte significative de performance</li>
+  </ul>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 4. AVANTAGES DE LORA/QLORA -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>4 · Avantages : pourquoi tout le monde utilise LoRA/QLoRA</h2>
+
+  <table class="comparison-table">
+    <thead>
+      <tr><th>Critère</th><th>Fine-tuning complet</th><th>LoRA</th><th>QLoRA</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Mémoire GPU</strong></td>
+        <td>Très élevée (700 Go pour 70B)</td>
+        <td>Réduite (proportionnelle à r)</td>
+        <td>Très réduite (40-50 Go pour 70B)</td>
+      </tr>
+      <tr>
+        <td><strong>Nombre de GPU</strong></td>
+        <td>18+ A100 pour 70B</td>
+        <td>2-4 A100 pour 70B</td>
+        <td>1 A100 ou RTX 4090 pour 70B</td>
+      </tr>
+      <tr>
+        <td><strong>Coût</strong></td>
+        <td>Très élevé ($10K-$50K+)</td>
+        <td>Modéré ($1K-$5K)</td>
+        <td>Faible ($100-$1K)</td>
+      </tr>
+      <tr>
+        <td><strong>Catastrophic forgetting</strong></td>
+        <td>Élevé (tous les poids changent)</td>
+        <td>Faible (seulement les adapteurs)</td>
+        <td>Faible</td>
+      </tr>
+      <tr>
+        <td><strong>Flexibilité</strong></td>
+        <td>Une tâche par modèle</td>
+        <td>Plusieurs tâches avec un modèle de base</td>
+        <td>Plusieurs tâches avec un modèle de base</td>
+      </tr>
+      <tr>
+        <td><strong>Temps d'entraînement</strong></td>
+        <td>Lent (beaucoup de paramètres)</td>
+        <td>Rapide (peu de paramètres)</td>
+        <td>Rapide</td>
+      </tr>
+      <tr>
+        <td><strong>Stockage</strong></td>
+        <td>Modèle complet par tâche</td>
+        <td>Adapteurs seulement (~1-10 Mo)</td>
+        <td>Adapteurs seulement (~1-10 Mo)</td>
+      </tr>
+      <tr>
+        <td><strong>Performance</strong></td>
+        <td>Référence (100%)</td>
+        <td>90-98% du full fine-tuning</td>
+        <td>85-95% du full fine-tuning</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <p>
+      <strong>Le compromis est clair :</strong> avec LoRA/QLoRA, on sacrifie 5-15% de performance 
+      pour diviser le coût par 10 à 100. C'est un échange que presque tout le monde accepte.
+    </p>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 5. CAS D'USAGE -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>5 · Cas d'usage : quand utiliser LoRA vs QLoRA</h2>
+  <span class="group-label">Scénarios · Bonnes pratiques</span>
+
+  <div class="callout">
+    <p>
+      <strong>LoRA et QLoRA ne sont pas interchangeables.</strong> Chaque méthode a ses cas d'usage optimaux.
+    </p>
+  </div>
+
+  <h3>Utiliser LoRA (sans quantification) quand :</h3>
+  <ul>
+    <li><strong>Vous avez des GPU avec beaucoup de mémoire</strong> (A100 80 Go, H100)</li>
+    <li><strong>La performance est critique</strong> et vous ne voulez pas sacrifier les 5-10% de QLoRA</li>
+    <li><strong>Vous entraînez sur des tâches complexes</strong> où chaque point de performance compte</li>
+    <li><strong>Vous voulez une compatibilité maximale</strong> avec les bibliothèques existantes</li>
+    <li><strong>Modèles de taille moyenne</strong> (7B-13B) où la quantification apporte moins de gains</li>
+  </ul>
+
+  <h3>Utiliser QLoRA quand :</h3>
+  <ul>
+    <li><strong>Vous avez des ressources limitées</strong> (1-2 GPU, RTX 4090)</li>
+    <li><strong>Vous travaillez avec des très grands modèles</strong> (30B-70B+)</li>
+    <li><strong>Le coût est un facteur critique</strong></li>
+    <li><strong>Vous faites du prototypage rapide</strong> et voulez itérer vite</li>
+    <li><strong>Vous avez besoin de fine-tuner plusieurs tâches</strong> en parallèle</li>
+  </ul>
+
+  <h3>Bonnes pratiques générales :</h3>
+  <ul>
+    <li><strong>Rang (r)</strong> : Commencez avec r=8 ou 16, puis augmentez si nécessaire. r=32 ou 64 pour des tâches complexes.</li>
+    <li><strong>Alpha (α)</strong> : Hyperparamètre de LoRA. Typiquement α=2×r ou α=16.</li>
+    <li><strong>Dropout</strong> : Ajoutez du dropout sur les adapteurs LoRA (0.05-0.1) pour éviter le surapprentissage.</li>
+    <li><strong>Modules cibles</strong> : Appliquez LoRA sur Q, V (au minimum). Pour plus de performance : Q, K, V, O.</li>
+    <li><strong>Taux d'apprentissage</strong> : Plus élevé que le full fine-tuning (typiquement 1e-4 à 5e-4 vs 1e-5).</li>
+    <li><strong>Batch size</strong> : Peut être plus petit grâce à la réduction de mémoire.</li>
+  </ul>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 6. LIMITES ET PIÈGES -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>6 · Limites et pièges à éviter</h2>
+  <span class="group-label">Quand LoRA/QLoRA ne suffisent pas</span>
+
+  <div class="callout warn">
+    <p>
+      <strong>LoRA et QLoRA ne sont pas des solutions magiques.</strong> Il y a des cas où le 
+      fine-tuning complet reste nécessaire.
+    </p>
+  </div>
+
+  <table class="comparison-table">
+    <thead>
+      <tr><th>Limite</th><th>Explication</th><th>Solution</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Performance limitée</strong></td>
+        <td>LoRA/QLoRA atteignent 85-98% de la performance du full fine-tuning</td>
+        <td>Augmenter r, utiliser plus de modules, ou passer au full fine-tuning</td>
+      </tr>
+      <tr>
+        <td><strong>Tâches très différentes</strong></td>
+        <td>Si la tâche est trop éloignée du pré-entraînement, les adapteurs ne suffisent pas</td>
+        <td>Full fine-tuning ou adapter plus de couches</td>
+      </tr>
+      <tr>
+        <td><strong>Quantification instable</strong></td>
+        <td>QLoRA peut être instable avec certains optimiseurs</td>
+        <td>Utiliser des optimiseurs adaptés (paged_adamw, bitsandbytes)</td>
+      </tr>
+      <tr>
+        <td><strong>Latence d'inférence</strong></td>
+        <td>La déquantification à la volée ajoute de la latence</td>
+        <td>Utiliser des bibliothèques optimisées (bitsandbytes, torch.compile)</td>
+      </tr>
+      <tr>
+        <td><strong>Compatibilité</strong></td>
+        <td>Tous les modèles ne supportent pas LoRA/QLoRA</td>
+        <td>Vérifier la compatibilité avant de commencer</td>
+      </tr>
+      <tr>
+        <td><strong>Choix de r</strong></td>
+        <td>Un r trop petit limite la capacité, un r trop grand annule les gains</td>
+        <td>Faire des tests avec différents r (8, 16, 32, 64)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    <strong>Quand utiliser le full fine-tuning malgré tout ?</strong>
+  </p>
+  <ul>
+    <li>Pour des tâches critiques où chaque point de performance compte</li>
+    <li>Quand vous avez les ressources et que le coût n'est pas un problème</li>
+    <li>Pour des modèles relativement petits (&lt;7B) où LoRA apporte peu de gains</li>
+    <li>Quand vous voulez éviter toute complexité d'implémentation</li>
+  </ul>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 7. IMPLÉMENTATION PRATIQUE -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>7 · Implémentation pratique : code et bibliothèques</h2>
+  <span class="group-label">PEFT · bitsandbytes · Transformers</span>
+
+  <div class="diagram">
+    <pre><code>Exemple avec la bibliothèque PEFT (Hugging Face) :
+
+from peft import LoraConfig, get_peft_model
+from transformers import AutoModelForCausalLM
+
+# Charger le modèle de base
+model = AutoModelForCausalLM.from_pretrained("mistralai/Mistral-7B")
+
+# Configuration LoRA
+lora_config = LoraConfig(
+    r=16,                    # rang
+    lora_alpha=32,          # alpha
+    target_modules=["q_proj", "v_proj"],  # modules cibles
+    lora_dropout=0.05,      # dropout
+    bias="none",            # pas de biais
+    task_type="CAUSAL_LM"  # type de tâche
+)
+
+# Appliquer LoRA
+model = get_peft_model(model, lora_config)
+
+# Entraînement (comme un fine-tuning normal)
+trainer.train()
+
+# Sauvegarder (seulement les adapteurs)
+model.save_pretrained("mistral-7b-lora")</code></pre>
+  </div>
+
+  <div class="diagram">
+    <pre><code>Exemple QLoRA avec bitsandbytes :
+
+from peft import LoraConfig
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+import torch
+
+# Configuration de quantification
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,      # charger en 4 bits
+    bnb_4bit_use_double_quant=True,  # double quantification
+    bnb_4bit_quant_type="nf4",      # type de quantification
+    bnb_4bit_compute_dtype=torch.float16  # calcul en FP16
+)
+
+# Charger le modèle quantifié
+model = AutoModelForCausalLM.from_pretrained(
+    "mistralai/Mistral-7B",
+    quantization_config=bnb_config,
+    device_map="auto"      # répartition automatique sur les GPU
+)
+
+# Configuration LoRA (même que avant)
+lora_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=["q_proj", "v_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM"
+)
+
+# Appliquer LoRA
+model = get_peft_model(model, lora_config)
+
+# Entraînement (les adapteurs sont en FP16, le reste en 4 bits)
+trainer.train()</code></pre>
+  </div>
+
+  <p>
+    <strong>Bibliothèques populaires :</strong>
+  </p>
+  <ul>
+    <li><strong>PEFT</strong> (Hugging Face) : Implémentation de référence pour LoRA, AdaLoRA, etc.</li>
+    <li><strong>bitsandbytes</strong> : Quantification 4/8 bits et optimiseurs compatibles</li>
+    <li><strong>Transformers</strong> : Intégration native avec LoRA/QLoRA</li>
+    <li><strong>Axolotl</strong> : Framework complet pour le fine-tuning avec LoRA/QLoRA</li>
+    <li><strong>vLLM</strong> : Inférence optimisée avec LoRA</li>
+  </ul>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 8. PIÈGES D'ENTRETIEN -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>8 · Les pièges d'entretien</h2>
+
+  <table>
+    <thead>
+      <tr><th>Piège</th><th>La bonne réponse</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>« LoRA entraîne tous les paramètres du modèle »</td>
+        <td>Non : LoRA gèle les poids originaux et n'entraîne que les matrices BA de faible rang.</td>
+      </tr>
+      <tr>
+        <td>« QLoRA quantifie aussi les adapteurs LoRA »</td>
+        <td>Non : dans QLoRA, seul le modèle de base est quantifié (en 4 bits). Les adapteurs restent en 16 bits.</td>
+      </tr>
+      <tr>
+        <td>« LoRA donne les mêmes résultats que le full fine-tuning »</td>
+        <td>Non : LoRA atteint 85-98% de la performance, pas 100%. C'est un compromis mémoire/performance.</td>
+      </tr>
+      <tr>
+        <td>« Plus le rang r est élevé, mieux c'est »</td>
+        <td>Non : un r trop élevé annule les gains de mémoire. Il faut trouver le bon compromis (typiquement 8-64).</td>
+      </tr>
+      <tr>
+        <td>« LoRA est seulement pour les petits modèles »</td>
+        <td>Non : LoRA est surtout utile pour les GRANDS modèles, où le full fine-tuning est prohibitif.</td>
+      </tr>
+      <tr>
+        <td>« QLoRA fonctionne avec n'importe quel GPU »</td>
+        <td>Non : QLoRA nécessite un GPU avec suffisamment de mémoire pour les activations (minimum 24 Go pour 70B).</td>
+      </tr>
+      <tr>
+        <td>« LoRA évite complètement le catastrophic forgetting »</td>
+        <td>Non : LoRA réduit le risque, mais ne l'élimine pas complètement. Le modèle de base reste figé.</td>
+      </tr>
+      <tr>
+        <td>« Les adapteurs LoRA sont spécifiques à une tâche »</td>
+        <td>Oui, c'est correct — mais c'est aussi une force : on peut avoir plusieurs adapteurs pour un même modèle de base.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- C.A.T. -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <div class="callout cat">
+    <h3>C.A.T. — « Expliquez LoRA et comment il réduit le coût du fine-tuning. »</h3>
+    <p><strong>Classify :</strong> « LoRA est une technique de fine-tuning efficace en paramètres qui permet d'adapter un grand modèle avec très peu de paramètres supplémentaires. »</p>
+    <p><strong>Apply :</strong> « Au lieu de mettre à jour tous les poids du modèle, LoRA gèle les poids originaux W et ajoute une adaptation de faible rang ΔW = BA, où B est une matrice d×r et A est une matrice r×k, avec r beaucoup plus petit que d et k (typiquement 8-64). Pendant l'entraînement, seuls B et A sont mis à jour. Pour un modèle de 70B, cela réduit le nombre de paramètres entraînables de 70 milliards à quelques millions seulement. »</p>
+    <p><strong>Trap :</strong> « Le piège serait de penser que LoRA n'a pas d'impact sur la performance. En réalité, on sacrifie 5-15% de performance pour diviser le coût par 10. C'est un compromis que la plupart des praticiens acceptent volontiers. »</p>
+  </div>
+
+  <div class="callout cat">
+    <h3>C.A.T. — « Quelle est la différence entre LoRA et QLoRA ? »</h3>
+    <p><strong>Classify :</strong> « LoRA et QLoRA sont tous deux des méthodes de fine-tuning efficace, mais QLoRA ajoute la quantification pour réduire encore plus la mémoire. »</p>
+    <p><strong>Apply :</strong> « LoRA gèle le modèle de base et entraîne seulement des adapteurs de faible rang. QLoRA va plus loin en quantifiant le modèle de base en 4 bits (avec NF4), ce qui réduit la mémoire du modèle de base de 8× (par rapport à FP16). Les adapteurs LoRA restent en 16 bits pour maintenir la précision pendant l'entraînement. Résultat : on peut fine-tuner un modèle de 70B sur un seul GPU A100 au lieu de 18. »</p>
+    <p><strong>Trap :</strong> « Le piège serait de penser que QLoRA quantifie aussi les adapteurs. Non, seuls les poids du modèle de base sont quantifiés. Les adapteurs restent en pleine précision pour garantir la stabilité de l'entraînement. »</p>
+  </div>
+
+  <div class="callout cat">
+    <h3>C.A.T. — « Pourquoi utiliser LoRA plutôt que le full fine-tuning ? »</h3>
+    <p><strong>Classify :</strong> « Parce que LoRA permet de réduire considérablement le coût et la mémoire nécessaires pour le fine-tuning. »</p>
+    <p><strong>Apply :</strong> « Pour fine-tuner un modèle de 70B, le full fine-tuning nécessite environ 700 Go de mémoire GPU (avec les gradients et l'optimiseur), ce qui veut dire 18 GPU A100. Avec LoRA, on n'entraîne que quelques millions de paramètres, donc la mémoire est proportionnelle à ces paramètres seulement. On passe de 18 GPU à 2-4 GPU. De plus, on peut sauvegarder et charger uniquement les adapteurs (quelques Mo) au lieu du modèle complet (140 Go). »</p>
+    <p><strong>Trap :</strong> « Mais attention : ce n'est pas gratuit. On sacrifie un peu de performance (5-15%), et il faut bien choisir le rang r et les modules cibles. Mais dans 90% des cas, c'est un compromis très acceptable. »</p>
+  </div>
+
+  <!-- ── QUIZ ───────────────────────────────────────────────────────── -->
+  <div class="quiz">
+    <h2>Contrôle de restitution</h2>
+    <p style="color:var(--muted); font-size:0.9rem; margin-bottom:1rem;">Ne cherchez pas. Répondez de mémoire, à voix haute si possible.</p>
+
+    <div class="quiz-q" id="q1">
+      <p>1. Que signifie LoRA ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Long-Range Attention</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Low-Rank Adaptation</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Layer-wise Optimization and Regularization</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q2">
+      <p>2. Combien de paramètres LoRA entraîne-t-on typiquement par rapport au modèle complet ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">10-20%</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">0.4-2%</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">50%</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q3">
+      <p>3. Quelle est la formule de l'adaptation LoRA ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">ΔW = W + αI</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">ΔW = BA</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">ΔW = W^T W</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q4">
+      <p>4. Que quantifie QLoRA ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Les adapteurs LoRA</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Le modèle de base (en 4 bits)</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Les gradients</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q5">
+      <p>5. Quelle bibliothèque est couramment utilisée pour LoRA/QLoRA ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">PyTorch Lightning</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">PEFT (Hugging Face)</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">TensorFlow</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q6">
+      <p>6. Quel est le principal avantage de LoRA ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Meilleure performance</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Réduction de la mémoire et du coût</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Élimination du catastrophic forgetting</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q7">
+      <p>7. Quelle valeur typique pour le rang r dans LoRA ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">512 ou 1024</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">8, 16, 32 ou 64</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">2 ou 4</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q8">
+      <p>8. Vrai ou Faux : QLoRA permet de fine-tuner un modèle de 70B sur un seul GPU RTX 4090</p>
+      <button class="quiz-option" onclick="answer(this,'correct')">Vrai</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Faux</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div id="score-banner" class="score-banner"></div>
+  </div>
+
+  <!-- ── SOURCES PRIMAIRES ───────────────────────────────────────────── -->
+  <h2>Sources primaires</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2106.09685" target="_blank">Hu et al. — « LoRA: Low-Rank Adaptation of Large Language Models »</a> (papier original LoRA)</li>
+    <li><a href="https://arxiv.org/abs/2305.14314" target="_blank">Dettmers et al. — « QLoRA: Efficient Finetuning of Quantized LLMs »</a> (papier original QLoRA)</li>
+    <li><a href="https://huggingface.co/docs/peft/index" target="_blank">Documentation PEFT (Hugging Face)</a></li>
+    <li><a href="https://github.com/TimDettmers/bitsandbytes" target="_blank">bitsandbytes — Quantification 4/8 bits</a></li>
+    <li><a href="https://huggingface.co/blog/4bit-transformers-bitsandbytes" target="_blank">Hugging Face Blog — 4-bit Transformers with bitsandbytes</a></li>
+  </ul>
+
+  <!-- ── ET ENSUITE ──────────────────────────────────────────────────── -->
+  <h2>Et ensuite</h2>
+  <p style="color:var(--muted); font-size:0.9rem;">
+    Dites « suivant » pour suivre le plan, ou choisissez une session :
+  </p>
+  <ul>
+    <li><strong>S12 — RAG :</strong> pipeline end-to-end, chunking, retrieval (Tier 4)</li>
+    <li><a href="0010-dpo-fr.html">S10 — DPO :</a> comment il remplace PPO et pourquoi</li>
+    <li><a href="0009-rlhf-fr.html">S09 — RLHF :</a> reward model, PPO et contrainte KL</li>
+    <li><a href="0003-llm-primitives-map.html">← Retour à la Carte des primitives</a></li>
+  </ul>
+
+  <div class="ask-teacher">
+    <strong>Posez n'importe quelle question à votre professeur.</strong> Vous voulez dérouler la 
+    dérivation mathématique de LoRA, comparer les implémentations, ou répéter une réponse C.A.T. 
+    à voix haute et obtenir un retour ? Dites-le simplement.
+  </div>
+
+</main>
+
+<script>
+  let answered = {};
+  const TOTAL = 8;
+  const feedbacks = {
+    correct: "Correct.",
+    wrong: "Pas tout à fait — relisez la section ci-dessus et réessayez."
+  };
+
+  function answer(btn, result) {
+    const qDiv = btn.closest('.quiz-q');
+    const qId = qDiv.id;
+    if (answered[qId]) return;
+    answered[qId] = result;
+
+    qDiv.querySelectorAll('.quiz-option').forEach(b => b.disabled = true);
+    btn.classList.add(result);
+    qDiv.querySelector('.quiz-feedback').textContent = feedbacks[result];
+
+    if (Object.keys(answered).length === TOTAL) {
+      const correct = Object.values(answered).filter(v => v === 'correct').length;
+      const banner = document.getElementById('score-banner');
+      banner.textContent = correct >= 7
+        ? `${correct}/${TOTAL} — excellent. Vous maîtrisez LoRA/QLoRA et leurs avantages.`
+        : correct >= 5
+          ? `${correct}/${TOTAL} — bien. Revoyez les points sur la réduction de mémoire.`
+          : `${correct}/${TOTAL} — relisez la leçon, puis expliquez LoRA vs QLoRA à voix haute.`;
+      banner.classList.add('show', correct >= 7 ? 'pass' : correct >= 5 ? 'partial' : 'fail');
+    }
+  }
+</script>
+</body>
+</html>

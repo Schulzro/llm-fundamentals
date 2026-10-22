@@ -1,0 +1,965 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Leçon 12 — RAG : pipeline end-to-end, chunking, retrieval</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <style>
+    .diagram {
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.25rem;
+      margin: 0 0 1.5rem;
+      overflow-x: auto;
+    }
+    .group-label {
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: #fff;
+      background: #5f3a1e;
+      display: inline-block;
+      padding: 0.2rem 0.6rem;
+      border-radius: 4px;
+      margin-bottom: 0.6rem;
+    }
+    .cat { border-left: 4px solid var(--ok); }
+    .cat h3 { margin-top: 0.3rem; }
+    .mono { font-family: var(--mono); font-size: 0.88rem; }
+    .comparison-table { margin: 1rem 0; }
+    .comparison-table td { vertical-align: top; }
+    .comparison-table th { text-align: left; }
+    .pipeline {
+      display: flex;
+      gap: 1rem;
+      align-items: center;
+      flex-wrap: wrap;
+      margin: 1rem 0;
+    }
+    .pipeline-step {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.5rem 1rem;
+      font-family: var(--mono);
+      font-size: 0.85rem;
+    }
+    .pipeline-arrow {
+      color: var(--muted);
+      font-size: 1.2rem;
+    }
+    .rag-triad {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1rem;
+      margin: 1rem 0;
+    }
+    .triad-item {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 1rem;
+      text-align: center;
+    }
+    .triad-item h4 {
+      font-family: var(--mono);
+      font-size: 0.85rem;
+      margin-bottom: 0.5rem;
+    }
+  </style>
+</head>
+<body>
+<main>
+
+  <div class="lesson-meta">Leçon 12 · Fondamentaux des LLM · Tier 4 — Comment les LLM sont déployés</div>
+  <h1>RAG : pipeline end-to-end, chunking, retrieval</h1>
+  <p style="color:var(--muted); font-size:0.9rem; margin-bottom:2rem;">~28 min · Objectif entretien : dérouler le pipeline RAG complet, expliquer les stratégies de chunking, comparer dense vs sparse retrieval, et nommer les métriques d'évaluation</p>
+
+  <!-- ── POURQUOI CE SUJET ──────────────────────────────────────────── -->
+  <div class="callout">
+    <p>
+      <strong>RAG (Retrieval-Augmented Generation) est la technique la plus populaire pour donner aux 
+      LLM l'accès à des connaissances externes.</strong> 
+      Sans RAG, un LLM ne peut répondre qu'avec ce qu'il a appris pendant le pré-entraînement. 
+      Avec RAG, il peut accéder à des documents spécifiques, des bases de connaissances privées, 
+      ou des informations en temps réel. En entretien, c'est <em>la</em> question système la plus demandée 
+      — et celle qui sépare ceux qui savent utiliser un LLM de ceux qui savent construire un système complet.
+    </p>
+  </div>
+
+  <p>
+    Cette leçon couvre : <strong>le pipeline RAG complet</strong>, 
+    <strong>les stratégies de chunking</strong>, 
+    <strong>dense vs sparse retrieval</strong>, 
+    <strong>le re-ranking</strong>, 
+    puis <strong>les métriques d'évaluation et les pièges courants</strong>.
+  </p>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 1. LE PIPELINE RAG COMPLET -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>1 · Le pipeline RAG : de l'ingestion à la génération</h2>
+  <span class="group-label">Ingest → Chunk → Embed → Retrieve → Generate</span>
+
+  <div class="callout">
+    <p>
+      <strong>RAG n'est pas juste « ajouter des documents ».</strong> C'est un pipeline en 5 étapes 
+      où chaque étape a un impact critique sur la qualité finale.
+    </p>
+  </div>
+
+  <div class="pipeline">
+    <div class="pipeline-step">📄 <strong>1. Ingestion</strong><br><small>Collecte des documents</small></div>
+    <span class="pipeline-arrow">→</span>
+    <div class="pipeline-step">✂️ <strong>2. Chunking</strong><br><small>Découpage en morceaux</small></div>
+    <span class="pipeline-arrow">→</span>
+    <div class="pipeline-step">🔍 <strong>3. Embedding</strong><br><small>Vectorisation</small></div>
+    <span class="pipeline-arrow">→</span>
+    <div class="pipeline-step">📊 <strong>4. Indexation</strong><br><small>Stockage dans une base vectorielle</small></div>
+    <span class="pipeline-arrow">→</span>
+    <div class="pipeline-step">↩️ <strong>5. Retrieval</strong><br><small>Récupération des chunks pertinents</small></div>
+    <span class="pipeline-arrow">→</span>
+    <div class="pipeline-step">💬 <strong>6. Génération</strong><br><small>Augmentation + réponse</small></div>
+  </div>
+
+  <div class="diagram">
+    <pre><code>Pipeline RAG détaillé :
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  ÉTAPE 1 : INGESTION                                                   │
+  │  • Collecter les documents (PDF, HTML, Markdown, bases de données) │
+  │  • Nettoyer le texte (supprimer le bruit, normaliser)              │
+  │  • Extraire le texte brut                                             │
+  └─────────────────────────────────────────────────────────────────┘
+                              ↓
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  ÉTAPE 2 : CHUNKING                                                   │
+  │  • Découper les documents en morceaux (chunks)                       │
+  │  • Taille typique : 256-1024 tokens                                   │
+  │  • Avec chevauchement (overlap) pour éviter les coupures           │
+  │  • Stratégies : fixe, par phrase, par paragraphe, récursif         │
+  └─────────────────────────────────────────────────────────────────┘
+                              ↓
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  ÉTAPE 3 : EMBEDDING                                                   │
+  │  • Passer chaque chunk dans un modèle d'embedding                   │
+  │  • Modèles populaires : text-embedding-ada-002, bge, all-MiniLM     │
+  │  • Dimension typique : 384-1024                                       │
+  │  • Normalisation (optionnelle)                                       │
+  └─────────────────────────────────────────────────────────────────┘
+                              ↓
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  ÉTAPE 4 : INDEXATION                                                 │
+  │  • Stocker les embeddings dans une base vectorielle                 │
+  │  • Index types : HNSW, IVF, FAISS, Weaviate, Pinecone, Qdrant        │
+  │  • Métadonnées : source, position, timestamp                        │
+  └─────────────────────────────────────────────────────────────────┘
+                              ↓
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  ÉTAPE 5 : RETRIEVAL                                                  │
+  │  • À la question de l'utilisateur, générer un embedding             │
+  │  • Rechercher les k plus proches voisins (k-NN)                    │
+  │  • k typique : 3-10                                                   │
+  │  • Optionnel : re-ranking avec un cross-encoder                     │
+  └─────────────────────────────────────────────────────────────────┘
+                              ↓
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  ÉTAPE 6 : GÉNÉRATION                                                 │
+  │  • Construire le prompt avec les chunks récupérés                  │
+  │  • Format : [Instruction] + [Context RAG]                            │
+  │  • Générer la réponse avec le LLM                                   │
+  │  • Post-traitement : citations, vérification, etc.                  │
+  └─────────────────────────────────────────────────────────────────┘</code></pre>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 2. CHUNKING : L'ART DE BIEN DÉCOUPER -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>2 · Chunking : l'art de bien découper les documents</h2>
+  <span class="group-label">Taille · Chevauchement · Stratégies</span>
+
+  <div class="callout">
+    <p>
+      <strong>Le chunking est l'étape la plus sous-estimée du RAG — et pourtant la plus critique.</strong> 
+      Un mauvais chunking = retrieval médiocre = réponses médiocres.
+    </p>
+  </div>
+
+  <h3>Taille des chunks : le compromis</h3>
+  <table class="comparison-table">
+    <thead>
+      <tr><th>Taille</th><th>Avantages</th><th>Inconvénients</th><th>Cas d'usage</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Petits (128-256 tokens)</strong></td>
+        <td>Précision fine, moins de bruit</td>
+        <td>Perte de contexte, coupures de phrases</td>
+        <td>Documents très structurés (tableaux, listes)</td>
+      </tr>
+      <tr>
+        <td><strong>Moyens (512-1024 tokens)</strong></td>
+        <td>Bon équilibre contexte/précision</td>
+        <td>Peut inclure du bruit</td>
+        <td>Cas général (articles, documentation)</td>
+      </tr>
+      <tr>
+        <td><strong>Grands (2048+ tokens)</strong></td>
+        <td>Contexte complet, pas de coupures</td>
+        <td>Bruit important, coût élevé</td>
+        <td>Documents très longs (livres, rapports)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Stratégies de chunking</h3>
+  <div class="diagram">
+    <pre><code>Stratégies de découpage :
+
+1. FIXE (Fixed Size Chunking)
+   • Découper tous les N tokens
+   • Simple à implémenter
+   • Risque : coupure en plein milieu d'une phrase
+
+2. PAR PHRASE (Sentence Window)
+   • Découper aux limites de phrases
+   • Meilleure cohérence sémantique
+   • Nécessite un tokeniseur de phrases
+
+3. PAR PARAGRAPHE
+   • Utiliser la structure du document
+   • Bon pour les articles, la documentation
+   • Peut donner des chunks de tailles très variables
+
+4. RÉCURSIF (Recursive Character Text Splitter)
+   • Essayer de découper par : ["\n\n", "\n", ".", ",", " "]
+   • Garantit des chunks cohérents
+   • Implémentation dans LangChain
+
+5. AVEC CHEVAUCHEMENT (Overlapping Chunks)
+   • Chaque chunk chevauche le précédent de X tokens
+   • X typique : 50-200 tokens (20-25% de la taille du chunk)
+   • Évite les problèmes de coupure aux limites
+   • Augmente le nombre de chunks (et donc le coût)</n
+6. HIÉRARCHIQUE (Parent Document Retrieval)
+   • Plusieurs niveaux de granularité
+   • D'abord récupérer des gros chunks, puis affiner
+   • Complexe mais puissant pour les grands corpus</code></pre>
+  </div>
+
+  <h3>Bonnes pratiques</h3>
+  <ul>
+    <li><strong>Taille par défaut :</strong> 512-1024 tokens avec 20% de chevauchement</li>
+    <li><strong>Respecter les limites de tokens :</strong> ne pas dépasser la fenêtre de contexte du LLM</li>
+    <li><strong>Nettoyer avant de chunker :</strong> supprimer les en-têtes, pieds de page, navigation</li>
+    <li><strong>Conserver les métadonnées :</strong> source, page, position pour le retrieval</li>
+    <li><strong>Tester plusieurs stratégies :</strong> le chunking optimal dépend du type de documents</li>
+  </ul>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 3. EMBEDDING : TRANSFORMER LE TEXTE EN VECTEURS -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>3 · Embedding : transformer le texte en vecteurs</h2>
+  <span class="group-label">Modèles · Dimension · Normalisation</span>
+
+  <div class="callout">
+    <p>
+      <strong>L'embedding est la représentation vectorielle du texte qui permet la recherche sémantique.</strong> 
+      Deux textes sémantiquement proches auront des embeddings proches dans l'espace vectoriel.
+    </p>
+  </div>
+
+  <h3>Modèles d'embedding populaires</h3>
+  <table class="comparison-table">
+    <thead>
+      <tr><th>Modèle</th><th>Fournisseur</th><th>Dimension</th><th>Cas d'usage</th><th>Avantages</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>text-embedding-ada-002</code></td>
+        <td>OpenAI</td>
+        <td>1536</td>
+        <td>Général</td>
+        <td>Bonne performance, standard de l'industrie</td>
+      </tr>
+      <tr>
+        <td><code>bge-small / bge-base</code></td>
+        <td>BAAI</td>
+        <td>384 / 768</td>
+        <td>Général / Multilingue</td>
+        <td>Open source, bon rapport qualité/prix</td>
+      </tr>
+      <tr>
+        <td><code>all-MiniLM</code></td>
+        <td>Sentence Transformers</td>
+        <td>384</td>
+        <td>Général</td>
+        <td>Léger, rapide, open source</td>
+      </tr>
+      <tr>
+        <td><code>e5-large</code></td>
+        <td>Intfloat</td>
+        <td>1024</td>
+        <td>Recherche avancée</td>
+        <td>Très bonne performance sur les benchmarks</td>
+      </tr>
+      <tr>
+        <td><code>instructor</code></td>
+        <td>HKUNLP</td>
+        <td>768</td>
+        <td>Embeddings avec instructions</td>
+        <td>Permet de spécifier la tâche dans le prompt</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Normalisation</h3>
+  <div class="diagram">
+    <pre><code>Normalisation des embeddings :
+
+  • Normalisation L2 (recommandée) :
+    x_normalized = x / ||x||_2
+    
+  • Avantages :
+    - La similarité cosinus = produit scalaire (plus rapide)
+    - Évite les problèmes d'échelle
+    - Meilleure performance en pratique
+    
+  • Quand normaliser ?
+    - Toujours pour la recherche (query et documents)
+    - Optionnel pour le stockage (mais recommandé)
+    
+  • Similarité cosinus :
+    similarity(a, b) = (a · b) / (||a|| ||b||)
+    
+    Avec normalisation L2 : similarity(a, b) = a · b</code></pre>
+  </div>
+
+  <h3>Bonnes pratiques</h3>
+  <ul>
+    <li><strong>Utiliser le même modèle pour query et documents</strong></li>
+    <li><strong>Normaliser les embeddings</strong> (L2 norm)</li>
+    <li><strong>Tester plusieurs modèles</strong> sur vos données</li>
+    <li><strong>Considérer la dimension</strong> : plus haute = plus précis mais plus lent et plus de mémoire</li>
+    <li><strong>Batch processing</strong> : générer les embeddings par lots pour optimiser</li>
+  </ul>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 4. RETRIEVAL : TROUVER LES BONS CHUNKS -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>4 · Retrieval : trouver les bons chunks</h2>
+  <span class="group-label">Dense vs Sparse · k-NN · Re-ranking</span>
+
+  <div class="callout">
+    <p>
+      <strong>Le retrieval est le cœur du RAG.</strong> Une mauvaise recherche = une mauvaise réponse, 
+      même avec le meilleur LLM du monde.
+    </p>
+  </div>
+
+  <h3>Dense Retrieval vs Sparse Retrieval</h3>
+  <table class="comparison-table">
+    <thead>
+      <tr><th>Critère</th><th>Dense Retrieval</th><th>Sparse Retrieval (BM25)</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Représentation</strong></td>
+        <td>Vecteurs denses (embeddings)</td>
+        <td>Mots-clés (TF-IDF, BM25)</td>
+      </tr>
+      <tr>
+        <td><strong>Sémantique</strong></td>
+        <td>✅ Comprend le sens (synonymes, paraphrases)</td>
+        <td>❌ Basé sur les mots exacts</td>
+      </tr>
+      <tr>
+        <td><strong>Vitesse</strong></td>
+        <td>⚡ Très rapide avec index vectoriel</td>
+        <td>⚡⚡ Très rapide (algorithmes matures)</td>
+      </tr>
+      <tr>
+        <td><strong>Mémoire</strong></td>
+        <td>Élevée (stockage des vecteurs)</td>
+        <td>Faible (stockage des termes inversés)</td>
+      </tr>
+      <tr>
+        <td><strong>Prétraitement</strong></td>
+        <td>Nécessite l'embedding de tous les documents</td>
+        <td>Aucun (utilise le texte brut)</td>
+      </tr>
+      <tr>
+        <td><strong>Performance</strong></td>
+        <td>✅✅ Excellente pour les requêtes sémantiques</td>
+        <td>✅ Bonne pour les requêtes avec mots-clés exacts</td>
+      </tr>
+      <tr>
+        <td><strong>Cas d'usage</strong></td>
+        <td>Questions en langage naturel, recherche sémantique</td>
+        <td>Recherche par mots-clés, documents structurés</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Hybrid Retrieval : le meilleur des deux mondes</h3>
+  <div class="diagram">
+    <pre><code>Hybrid Retrieval = Dense + Sparse
+
+  • Combiner les scores des deux méthodes
+  • Méthodes de combinaison :
+    - Addition simple : score_final = score_dense + score_sparse
+    - Pondération : score_final = α·score_dense + (1-α)·score_sparse
+    - RRF (Reciprocal Rank Fusion) : méthode robuste sans réglage de α
+
+  RRF (formule) :
+    score_RRF = 1 / (k + rank_dense) + 1 / (k + rank_sparse)
+    où k est un paramètre de normalisation (typiquement k=60)
+
+  Avantages de l'hybride :
+    ✅ Meilleure couverture (capture à la fois sémantique et mots-clés)
+    ✅ Plus robuste aux différentes formulations de requêtes
+    ✅ Meilleure performance globale dans la plupart des benchmarks</code></pre>
+  </div>
+
+  <h3>Re-ranking : affiner les résultats</h3>
+  <div class="callout">
+    <p>
+      <strong>Le re-ranking est l'étape secrète pour améliorer la qualité du retrieval.</strong> 
+      Après une première recherche rapide (avec dense ou sparse), on utilise un modèle plus puissant 
+      pour réordonner les résultats.
+    </p>
+  </div>
+
+  <div class="diagram">
+    <pre><code>Re-ranking avec Cross-Encoder :
+
+  Étape 1 : Retrieval initial (rapide)
+    • Utiliser un bi-encoder (dense) ou BM25
+    • Récupérer k=50-100 chunks candidats
+    
+  Étape 2 : Re-ranking (plus lent mais précis)
+    • Utiliser un cross-encoder (ex: BERT, RoBERTa)
+    • Le cross-encoder prend [query, document] comme entrée
+    • Il calcule un score de pertinence plus précis
+    • Sélectionner les top k=3-10 chunks finaux
+
+  Modèles de re-ranking populaires :
+    • bge-reranker (BAAI)
+    • FlagModel/BAAI-bge-reranker-base
+    • cross-encoder/ms-marco-MiniLM-L-6-v2
+    • cross-encoder/ms-marco-MiniLM-L-12-v2
+
+  Avantages :
+    ✅ Meilleure précision (le cross-encoder voit query+document ensemble)
+    ✅ Compromis vitesse/précision optimal
+    
+  Inconvénients :
+    ❌ Plus lent (nécessite de passer chaque paire [query, doc] dans le modèle)
+    ❌ Plus de ressources computationnelles</code></pre>
+  </div>
+
+  <h3>Index vectoriels</h3>
+  <div class="diagram">
+    <pre><code>Types d'index vectoriels :
+
+  1. HNSW (Hierarchical Navigable Small World)
+     • Algorithme : graphe hiérarchique
+     • Avantages : très rapide, bonne précision
+     • Inconvénients : mémoire élevée
+     • Implémentations : FAISS, Weaviate, Qdrant
+     
+  2. IVF (Inverted File Index)
+     • Algorithme : partitionnement + recherche dans les partitions
+     • Avantages : faible mémoire, bon pour les grands datasets
+     • Inconvénients : précision légèrement inférieure
+     • Implémentations : FAISS
+     
+  3. PQ (Product Quantization)
+     • Algorithme : compression des vecteurs
+     • Avantages : réduit la mémoire de 4-16×
+     • Inconvénients : perte de précision
+     • Souvent combiné avec IVF (IVF-PQ)
+     
+  4. LSH (Locality-Sensitive Hashing)
+     • Algorithme : hachage aléatoire
+     • Avantages : très rapide pour l'indexation
+     • Inconvénients : précision limitée
+     
+  Bases vectorielles populaires :
+    • FAISS (Facebook) : bibliothèque C++ optimisée
+    • Weaviate : base vectorielle open source avec API
+    • Pinecone : service managé
+    • Qdrant : base vectorielle open source
+    • Milvus : base vectorielle distribuée</code></pre>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 5. LE TRIADE RAG : RELEVANCE, FAITHFULNESS, ANSWER -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>5 · La triade RAG : relevance, faithfulness, answer</h2>
+  <span class="group-label">Les 3 piliers de l'évaluation RAG</span>
+
+  <div class="callout">
+    <p>
+      <strong>Un bon système RAG doit exceller sur trois dimensions.</strong> 
+      Optimiser une seule dimension au détriment des autres donne un système déséquilibré.
+    </p>
+  </div>
+
+  <div class="rag-triad">
+    <div class="triad-item">
+      <h4>🎯 Relevance</h4>
+      <p>Les documents récupérés sont-ils pertinents pour la question ?</p>
+      <ul>
+        <li>Métrique : précision@k, recall@k</li>
+        <li>Outils : évaluation humaine, LLM-as-judge</li>
+        <li>Amélioration : meilleur embedding, re-ranking</li>
+      </ul>
+    </div>
+    <div class="triad-item">
+      <h4>📜 Faithfulness</h4>
+      <p>La réponse est-elle fidèle aux documents récupérés ?</p>
+      <ul>
+        <li>Métrique : faithfulness score, citation recall</li>
+        <li>Outils : vérification des citations, détection d'hallucinations</li>
+        <li>Amélioration : prompt engineering, vérification post-génération</li>
+      </ul>
+    </div>
+    <div class="triad-item">
+      <h4>✅ Answer</h4>
+      <p>La réponse est-elle correcte et utile ?</p>
+      <ul>
+        <li>Métrique : exact match, F1 score, utilité perçue</li>
+        <li>Outils : évaluation humaine, benchmarks standard</li>
+        <li>Amélioration : meilleur LLM, prompt optimisé</li>
+      </ul>
+    </div>
+  </div>
+
+  <p>
+    <strong>Exemple concret :</strong>
+  </p>
+  <ul>
+    <li><strong>Bonne relevance, mauvaise faithfulness :</strong> Le système récupère les bons documents, mais le LLM invente des informations qui ne sont pas dans les documents.</li>
+    <li><strong>Bonne faithfulness, mauvaise relevance :</strong> Le système récupère des documents non pertinents, mais la réponse est fidèle à ces documents (donc fausse).</li>
+    <li><strong>Bonne relevance et faithfulness, mauvaise answer :</strong> Les documents sont pertinents et la réponse leur est fidèle, mais elle ne répond pas vraiment à la question.</li>
+  </ul>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 6. ÉVALUATION RAG -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>6 · Évaluation : comment mesurer la qualité d'un système RAG</h2>
+  <span class="group-label">Métriques · Ragas · Benchmarks</span>
+
+  <div class="callout">
+    <p>
+      <strong>Évaluer un système RAG est complexe.</strong> Contrairement aux tâches classiques de ML, 
+      il n'y a pas de métrique unique qui capture tout.
+    </p>
+  </div>
+
+  <h3>Métriques RAG (Ragas)</h3>
+  <p>
+    <strong>Ragas</strong> est une bibliothèque Python spécialement conçue pour évaluer les systèmes RAG. 
+    Elle implémente plusieurs métriques alignées sur la triade RAG :
+  </p>
+
+  <table class="comparison-table">
+    <thead>
+      <tr><th>Métrique</th><th>Description</th><th>Dimension</th><th>Plage</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Answer Relevancy</strong></td>
+        <td>La réponse est-elle pertinente pour la question ?</td>
+        <td>Answer</td>
+        <td>0-1</td>
+      </tr>
+      <tr>
+        <td><strong>Faithfulness</strong></td>
+        <td>La réponse est-elle fidèle aux documents récupérés ?</td>
+        <td>Faithfulness</td>
+        <td>0-1</td>
+      </tr>
+      <tr>
+        <td><strong>Context Relevancy</strong></td>
+        <td>Les documents récupérés sont-ils pertinents pour la question ?</td>
+        <td>Relevance</td>
+        <td>0-1</td>
+      </tr>
+      <tr>
+        <td><strong>Context Recall</strong></td>
+        <td>Tous les documents pertinents ont-ils été récupérés ?</td>
+        <td>Relevance</td>
+        <td>0-1</td>
+      </tr>
+      <tr>
+        <td><strong>Context Precision</strong></td>
+        <td>Seuls les documents pertinents ont-ils été récupérés ?</td>
+        <td>Relevance</td>
+        <td>0-1</td>
+      </tr>
+      <tr>
+        <td><strong>Latency</strong></td>
+        <td>Temps de réponse (retrieval + génération)</td>
+        <td>Performance</td>
+        <td>ms</td>
+      </tr>
+      <tr>
+        <td><strong>Cost</strong></td>
+        <td>Coût par requête (tokens input + output)</td>
+        <td>Performance</td>
+        <td>$</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>LLM-as-Judge</h3>
+  <div class="diagram">
+    <pre><code>LLM-as-Judge : utiliser un LLM pour évaluer les réponses
+
+  Avantages :
+    ✅ Flexible (peut évaluer n'importe quelle dimension)
+    ✅ Pas besoin de données labellisées
+    ✅ Peut donner des feedbacks détaillés
+    
+  Inconvénients :
+    ❌ Coûteux (chaque évaluation = une inférence LLM)
+    ❌ Subjectif (dépend du LLM juge)
+    ❌ Nécessite un prompt d'évaluation bien conçu
+    
+  Exemple de prompt d'évaluation :
+    
+  """
+  Tu es un évaluateur strict. Évalue la réponse suivante selon ces critères :
+  1. Relevance : La réponse répond-elle à la question ? (1-5)
+  2. Faithfulness : La réponse est-elle fidèle aux documents fournis ? (1-5)
+  3. Utilité : La réponse est-elle utile pour l'utilisateur ? (1-5)
+  
+  Question : {question}
+  Documents : {documents}
+  Réponse : {answer}
+  
+  Donne un score pour chaque critère et une justification.
+  """</code></pre>
+  </div>
+
+  <h3>Benchmarks RAG</h3>
+  <ul>
+    <li><strong>BEIR</strong> : Benchmark pour l'évaluation du retrieval</li>
+    <li><strong>MTEB</strong> (Massive Text Embedding Benchmark) : évaluation des modèles d'embedding</li>
+    <li><strong>RAGTruth</strong> : benchmark spécifique au RAG</li>
+    <li><strong>CRAG</strong> (Correctness and Relevance Assessment for Grounding) : évaluation de la correction et de la pertinence</li>
+  </ul>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 7. PIÈGES COURANTS ET BONNES PRATIQUES -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>7 · Pièges courants et bonnes pratiques</h2>
+  <span class="group-label">Erreurs · Solutions · Optimisations</span>
+
+  <div class="callout warn">
+    <p>
+      <strong>Le RAG semble simple, mais il y a de nombreux pièges.</strong> 
+      Voici les erreurs les plus courantes et comment les éviter.
+    </p>
+  </div>
+
+  <h3>Pièges courants</h3>
+  <table class="comparison-table">
+    <thead>
+      <tr><th>Piège</th><th>Conséquence</th><th>Solution</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Chunks trop grands</strong></td>
+        <td>Bruit dans le retrieval, documents non pertinents</td>
+        <td>Utiliser des chunks de 512-1024 tokens</td>
+      </tr>
+      <tr>
+        <td><strong>Pas de chevauchement</strong></td>
+        <td>Information coupée entre les chunks</td>
+        <td>Ajouter 20% de chevauchement</td>
+      </tr>
+      <tr>
+        <td><strong>Embeddings non normalisés</strong></td>
+        <td>Mauvaise performance de recherche</td>
+        <td>Normaliser les embeddings (L2 norm)</td>
+      </tr>
+      <tr>
+        <td><strong>k trop petit</strong></td>
+        <td>Pas assez de contexte pour le LLM</td>
+        <td>Utiliser k=3-10 selon la complexité</td>
+      </tr>
+      <tr>
+        <td><strong>k trop grand</strong></td>
+        <td>Trop de bruit, coût élevé</td>
+        <td>Limiter k et utiliser le re-ranking</td>
+      </tr>
+      <tr>
+        <td><strong>Pas de re-ranking</strong></td>
+        <td>Précision limitée avec dense retrieval seul</td>
+        <td>Ajouter un cross-encoder pour le re-ranking</td>
+      </tr>
+      <tr>
+        <td><strong>Prompt mal construit</strong></td>
+        <td>Le LLM ignore le contexte RAG</td>
+        <td>Utiliser des instructions claires : "Utilise les documents suivants pour répondre..."</td>
+      </tr>
+      <tr>
+        <td><strong>Pas de citations</strong></td>
+        <td>Impossible de vérifier la faithfulness</td>
+        <td>Demander au LLM de citer ses sources</td>
+      </tr>
+      <tr>
+        <td><strong>Documents non nettoyés</strong></td>
+        <td>Bruit dans les embeddings et le retrieval</td>
+        <td>Nettoyer les documents avant l'ingestion</td>
+      </tr>
+      <tr>
+        <td><strong>Index non mis à jour</strong></td>
+        <td>Documents obsolètes dans les résultats</td>
+        <td>Mettre en place un pipeline de mise à jour</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Bonnes pratiques générales</h3>
+  <ul>
+    <li><strong>Commencer simple :</strong> dense retrieval + petit k, puis complexifier</li>
+    <li><strong>Évaluer à chaque étape :</strong> retrieval seul, puis RAG complet</li>
+    <li><strong>Monitorer les métriques :</strong> relevance, faithfulness, answer quality</li>
+    <li><strong>Optimiser pour le coût :</strong> limiter le nombre de tokens dans le prompt</li>
+    <li><strong>Tester avec des requêtes réelles :</strong> pas seulement des benchmarks</li>
+    <li><strong>Itérer rapidement :</strong> le RAG est un processus itératif</li>
+  </ul>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- 8. PIÈGES D'ENTRETIEN -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <h2>8 · Les pièges d'entretien</h2>
+
+  <table>
+    <thead>
+      <tr><th>Piège</th><th>La bonne réponse</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>« RAG permet au LLM d'apprendre de nouveaux faits »</td>
+        <td>Non : RAG donne accès à des informations externes, mais le LLM ne les « apprend » pas. Il les utilise juste pour la réponse actuelle.</td>
+      </tr>
+      <tr>
+        <td>« RAG remplace le fine-tuning »</td>
+        <td>Non : RAG et fine-tuning sont complémentaires. RAG pour l'information externe, fine-tuning pour les compétences et le style.</td>
+      </tr>
+      <tr>
+        <td>« Plus on récupère de documents, mieux c'est »</td>
+        <td>Non : trop de documents = bruit. Il faut trouver le bon k (typiquement 3-10).</td>
+      </tr>
+      <tr>
+        <td>« RAG est toujours plus rapide que le fine-tuning »</td>
+        <td>Non : le retrieval peut être lent avec des grands index. De plus, le prompt RAG est plus long.</td>
+      </tr>
+      <tr>
+        <td>« RAG élimine les hallucinations »</td>
+        <td>Non : RAG réduit les hallucinations, mais ne les élimine pas. Le LLM peut encore inventer des informations.</td>
+      </tr>
+      <tr>
+        <td>« Dense retrieval est toujours meilleur que sparse »</td>
+        <td>Non : sparse (BM25) est meilleur pour les requêtes avec mots-clés exacts. Dense est meilleur pour les requêtes sémantiques.</td>
+      </tr>
+      <tr>
+        <td>« Le chunking n'a pas d'importance »</td>
+        <td>Non : le chunking est critique. Un mauvais chunking = retrieval médiocre = réponses médiocres.</td>
+      </tr>
+      <tr>
+        <td>« RAG fonctionne avec n'importe quel LLM »</td>
+        <td>Oui, c'est correct — mais les petits modèles peuvent avoir du mal à utiliser efficacement le contexte RAG.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- C.A.T. -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <div class="callout cat">
+    <h3>C.A.T. — « Expliquez le pipeline RAG de bout en bout. »</h3>
+    <p><strong>Classify :</strong> « RAG (Retrieval-Augmented Generation) est une technique qui permet à un LLM d'accéder à des informations externes pour améliorer ses réponses. »</p>
+    <p><strong>Apply :</strong> « Le pipeline RAG se compose de 6 étapes : 1) Ingestion des documents, 2) Chunking (découpage en morceaux de 512-1024 tokens avec chevauchement), 3) Embedding (vectorisation avec un modèle comme text-embedding-ada-002), 4) Indexation (stockage dans une base vectorielle comme FAISS ou Weaviate), 5) Retrieval (récupération des k chunks les plus pertinents avec dense ou sparse retrieval), et 6) Génération (construction du prompt avec le contexte RAG et réponse du LLM). »</p>
+    <p><strong>Trap :</strong> « Le piège serait de penser que RAG est juste 'ajouter des documents'. En réalité, chaque étape a un impact critique. Par exemple, un mauvais chunking peut rendre le retrieval inefficace, même avec le meilleur modèle d'embedding. »</p>
+  </div>
+
+  <div class="callout cat">
+    <h3>C.A.T. — « Quelle est la différence entre dense et sparse retrieval ? »</h3>
+    <p><strong>Classify :</strong> « Dense retrieval utilise des embeddings vectoriels pour capturer la sémantique, tandis que sparse retrieval utilise des mots-clés et des statistiques comme TF-IDF ou BM25. »</p>
+    <p><strong>Apply :</strong> « Dense retrieval représente chaque document par un vecteur dense (384-1024 dimensions) généré par un modèle de langage. La similarité est calculée avec la similarité cosinus. Sparse retrieval, comme BM25, utilise une représentation creuse basée sur les termes du document et leurs fréquences. Dense est meilleur pour les requêtes sémantiques ('Quels sont les symptômes de la grippe ?'), tandis que sparse est meilleur pour les requêtes avec mots-clés exacts ('document PDF section 3.2'). »</p>
+    <p><strong>Trap :</strong> « Le piège serait de choisir une seule méthode. En pratique, l'approche hybride (dense + sparse avec RRF) donne les meilleurs résultats, car elle combine les forces des deux approches. »</p>
+  </div>
+
+  <div class="callout cat">
+    <h3>C.A.T. — « Pourquoi le chunking est-il important en RAG ? »</h3>
+    <p><strong>Classify :</strong> « Le chunking est l'étape qui détermine comment les documents sont découpés avant l'embedding et le retrieval. »</p>
+    <p><strong>Apply :</strong> « Si les chunks sont trop grands, on récupère des documents avec beaucoup de bruit. Si les chunks sont trop petits, on perd le contexte et on peut couper des informations importantes au milieu. Une bonne pratique est d'utiliser des chunks de 512-1024 tokens avec 20% de chevauchement. Par exemple, avec un document de 2000 tokens et des chunks de 512 tokens avec 100 tokens de chevauchement, on obtient 5 chunks : [0-512], [412-924], [824-1336], [1236-1748], [1648-2000]. »</p>
+    <p><strong>Trap :</strong> « Le piège serait de penser que le chunking est une étape secondaire. En réalité, c'est souvent l'étape la plus critique après le choix du modèle d'embedding. Un mauvais chunking peut rendre même le meilleur retrieval inefficace. »</p>
+  </div>
+
+  <div class="callout cat">
+    <h3>C.A.T. — « Comment évaluez-vous un système RAG ? »</h3>
+    <p><strong>Classify :</strong> « On évalue un système RAG selon trois dimensions principales : relevance, faithfulness, et answer quality. »</p>
+    <p><strong>Apply :</strong> « La relevance mesure si les documents récupérés sont pertinents pour la question. On peut l'évaluer avec la précision@k ou le recall@k. La faithfulness mesure si la réponse est fidèle aux documents récupérés, sans inventer d'informations. On peut utiliser des métriques comme le faithfulness score ou vérifier manuellement les citations. Enfin, l'answer quality mesure si la réponse est correcte et utile pour l'utilisateur. Des bibliothèques comme Ragas implémentent ces métriques automatiquement. »</p>
+    <p><strong>Trap :</strong> « Le piège serait de se concentrer sur une seule métrique. Par exemple, optimiser seulement la relevance peut donner des documents pertinents, mais le LLM peut quand même produire une réponse incorrecte (mauvaise faithfulness ou answer quality). Il faut équilibrer les trois dimensions. »</p>
+  </div>
+
+  <!-- ── QUIZ ───────────────────────────────────────────────────────── -->
+  <div class="quiz">
+    <h2>Contrôle de restitution</h2>
+    <p style="color:var(--muted); font-size:0.9rem; margin-bottom:1rem;">Ne cherchez pas. Répondez de mémoire, à voix haute si possible.</p>
+
+    <div class="quiz-q" id="q1">
+      <p>1. Que signifie RAG ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Recursive Augmented Generation</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Retrieval-Augmented Generation</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Reinforced Answer Generation</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q2">
+      <p>2. Combien d'étapes principales dans le pipeline RAG ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">3</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">4</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">6</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q3">
+      <p>3. Quelle est la taille typique d'un chunk en RAG ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">16-32 tokens</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">512-1024 tokens</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">4096-8192 tokens</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q4">
+      <p>4. Quel modèle est couramment utilisé pour l'embedding en RAG ?</p>
+      <button class="quiz-option" onclick="answer(this,'correct')">text-embedding-ada-002</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">gpt-4</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">BERT</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q5">
+      <p>5. Quelle est la différence principale entre dense et sparse retrieval ?</p>
+      <button class="quiz-option" onclick="answer(this,'correct')">Dense utilise des vecteurs, sparse utilise des mots-clés</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Dense est plus lent, sparse est plus rapide</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Dense nécessite plus de mémoire, sparse moins</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q6">
+      <p>6. Que fait le re-ranking en RAG ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Il récupère plus de documents</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Il réordonne les résultats du retrieval initial pour plus de précision</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Il génère la réponse finale</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q7">
+      <p>7. Quelles sont les 3 dimensions de la triade RAG ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Précision, Rappel, F1</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Relevance, Faithfulness, Answer</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Vitesse, Coût, Qualité</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q8">
+      <p>8. Vrai ou Faux : RAG permet au LLM d'apprendre de nouveaux faits</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Vrai</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Faux</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q9">
+      <p>9. Quel est l'avantage principal du chevauchement (overlap) en chunking ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Réduire le nombre de chunks</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Éviter les coupures d'information entre les chunks</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">Augmenter la vitesse de retrieval</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div class="quiz-q" id="q10">
+      <p>10. Quelle bibliothèque est spécialisée dans l'évaluation RAG ?</p>
+      <button class="quiz-option" onclick="answer(this,'wrong')">LangChain</button>
+      <button class="quiz-option" onclick="answer(this,'correct')">Ragas</button>
+      <button class="quiz-option" onclick="answer(this,'wrong')">FAISS</button>
+      <div class="quiz-feedback"></div>
+    </div>
+
+    <div id="score-banner" class="score-banner"></div>
+  </div>
+
+  <!-- ── SOURCES PRIMAIRES ───────────────────────────────────────────── -->
+  <h2>Sources primaires</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2005.11401" target="_blank">Lewis et al. — « Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks »</a> (papier original RAG)</li>
+    <li><a href="https://arxiv.org/abs/2309.15507" target="_blank">Gao et al. — « Precise Zero-Shot Dense Retrieval without Re-ranking »</a> (sur les embeddings)</li>
+    <li><a href="https://arxiv.org/abs/1607.05368" target="_blank">Robertson & Zaragoza — « The Probabilistic Relevance Framework »</a> (BM25)</li>
+    <li><a href="https://arxiv.org/abs/1905.03197" target="_blank">Johnson et al. — « Billion-scale similarity search with GPUs »</a> (FAISS)</li>
+    <li><a href="https://github.com/langchain-ai/langchain" target="_blank">LangChain — Framework RAG populaire</a></li>
+    <li><a href="https://github.com/ragas-ai/ragas" target="_blank">Ragas — Bibliothèque d'évaluation RAG</a></li>
+  </ul>
+
+  <!-- ── ET ENSUITE ──────────────────────────────────────────────────── -->
+  <h2>Et ensuite</h2>
+  <p style="color:var(--muted); font-size:0.9rem;">
+    Dites « suivant » pour suivre le plan, ou choisissez une session :
+  </p>
+  <ul>
+    <li><strong>S13 — Dense vs sparse retrieval + re-ranking :</strong> approfondir les techniques de retrieval (Tier 4)</li>
+    <li><a href="0011-lora-qlora-fr.html">S11 — LoRA / QLoRA :</a> fine-tuning sans le coût complet</li>
+    <li><a href="0010-dpo-fr.html">S10 — DPO :</a> comment il remplace PPO et pourquoi</li>
+    <li><a href="0003-llm-primitives-map.html">← Retour à la Carte des primitives</a></li>
+  </ul>
+
+  <div class="ask-teacher">
+    <strong>Posez n'importe quelle question à votre professeur.</strong> Vous voulez dérouler le pipeline 
+    RAG sur un exemple concret, comparer dense vs sparse retrieval, ou répéter une réponse C.A.T. 
+    à voix haute et obtenir un retour ? Dites-le simplement.
+  </div>
+
+</main>
+
+<script>
+  let answered = {};
+  const TOTAL = 10;
+  const feedbacks = {
+    correct: "Correct.",
+    wrong: "Pas tout à fait — relisez la section ci-dessus et réessayez."
+  };
+
+  function answer(btn, result) {
+    const qDiv = btn.closest('.quiz-q');
+    const qId = qDiv.id;
+    if (answered[qId]) return;
+    answered[qId] = result;
+
+    qDiv.querySelectorAll('.quiz-option').forEach(b => b.disabled = true);
+    btn.classList.add(result);
+    qDiv.querySelector('.quiz-feedback').textContent = feedbacks[result];
+
+    if (Object.keys(answered).length === TOTAL) {
+      const correct = Object.values(answered).filter(v => v === 'correct').length;
+      const banner = document.getElementById('score-banner');
+      banner.textContent = correct >= 8
+        ? `${correct}/${TOTAL} — excellent. Vous maîtrisez le pipeline RAG complet.`
+        : correct >= 6
+          ? `${correct}/${TOTAL} — bien. Revoyez le chunking et le retrieval.`
+          : `${correct}/${TOTAL} — relisez la leçon, puis expliquez le pipeline RAG à voix haute.`;
+      banner.classList.add('show', correct >= 8 ? 'pass' : correct >= 6 ? 'partial' : 'fail');
+    }
+  }
+</script>
+</body>
+</html>
